@@ -1,8 +1,8 @@
 # Hello kernel: a Hydra program booting on bare-metal RISC-V
 
 - **Date:** 2026-11-23
-- **Status:** draft for review (increment 1)
-- **Repo:** `divizend/hydra-os` (private)
+- **Status:** approved by the operator on 2026-11-23 (increment 1)
+- **Repo:** `divizend/hydra-os` (public)
 
 In this document "the kernel" means our OS kernel. Hydra's own core is called "Hydra's kernel" (`hydra-kernel`).
 
@@ -309,7 +309,7 @@ The launcher contains no RISC-V knowledge and no project logic.
 
 ## Delivery
 
-- **Repo:** GitHub `divizend/hydra-os`, private (my call; it can be made public any time).
+- **Repo:** GitHub `divizend/hydra-os`, public (the operator's decision).
 - **Build output:** `out/hello.bin` is committed, because the operator gets files with `git pull`, never by copying them off the box.
 
 ## Risks to retire first, in order
