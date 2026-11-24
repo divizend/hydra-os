@@ -1,0 +1,9 @@
+## Coder fixture: main writes more bytes than the length register's single addi can load.
+module hydraos.unsupported.long
+
+import hydra.core.lib.lists
+import hydra.core.lib.strings
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+term main = writeStdout (encodeUtf8 (fromList (replicate 2101:int32 120:int32)))

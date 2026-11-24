@@ -1,7 +1,8 @@
 ## The RISC-V coder: compile a Hydra module's main into a hydraos.riscv.model.Program.
 ##
-## This increment supports exactly one shape: main = writeStdout x, where x is pure and Hydra's own
-## evaluator reduces it to a binary literal during the build. Anything else is rejected with an error
+## This increment supports exactly one shape: main = writeStdout x, where x is pure, may use the
+## module's other definitions, reduces to a binary literal during the build, and is at most 2047
+## bytes long (main loads the length with a single addi). Anything else is rejected with an error
 ## that names the construct. main tail-calls the runtime's writeStdout routine, because main's value
 ## is writeStdout's value; the routine then returns straight to the start-up code, so no stack is
 ## needed.
@@ -21,6 +22,7 @@ import hydra.core.lib.lists as lists
 import hydra.core.lib.literals as literals
 import hydra.core.lib.logic as logic
 import hydra.core.lib.optionals as optionals
+import hydra.core.lib.ordering as ordering
 import hydra.core.lib.strings as strings
 import hydraos.riscv.dsl
 import hydraos.riscv.encode
@@ -48,35 +50,63 @@ term describeHead = λt:Term.
     `_` = describe s}
   s
 
+## The full name of a module's main, e.g. hydraos.hello.main.
+term mainName = λm:Module. strings.concat2 (ModuleName[] (Module[name] m)) ".main"
+
+## The module's term definitions, main included or not.
+term termDefinitions = λm:Module, withMain:boolean.
+  lists.concat (lists.map
+    (λd:Definition. cases(hydra.core.packaging.Definition){
+      `term` = λtd:TermDefinition. logic.ifElse
+        (logic.or withMain (logic.not (equality.equal (Name[] (TermDefinition[name] td)) (mainName m))))
+        [td] [],
+      `_` = []} d)
+    (Module[definitions] m))
+
 ## The body of the module's term definition named main, if there is one.
 term mainBody = λm:Module.
-  let mainName := strings.concat2 (ModuleName[] (Module[name] m)) ".main"
-  in lists.head (lists.concat (lists.map
-    (λd:Definition. cases(hydra.core.packaging.Definition){
-      `term` = λtd:TermDefinition. logic.ifElse (equality.equal (Name[] (TermDefinition[name] td)) mainName) [TermDefinition[body] td] [],
-      `_` = []} d)
-    (Module[definitions] m)))
+  lists.head (lists.concat (lists.map
+    (λtd:TermDefinition. logic.ifElse (equality.equal (Name[] (TermDefinition[name] td)) (mainName m)) [TermDefinition[body] td] [])
+    (termDefinitions m true)))
 
-## The error for an argument of writeStdout that does not reduce to a binary literal.
-term notBinary = eithers.left "hydraos.riscv.coder: argument of writeStdout did not reduce to a binary literal"
+## x inside a let that binds the module's other term definitions, with all types removed: a module
+## is a let over its definitions. Hydra 0.18.1's reducer neither reduces through System F type
+## applications nor reduces a graph-bound variable before handing it to a primitive, so the
+## definitions are let-bound (and substituted) rather than looked up in the graph.
+term withModuleBindings = λm:Module, x:Term.
+  inject(hydra.core.model.Term){`let` = record(hydra.core.model.Let){
+    bindings = lists.map
+      (λtd:TermDefinition. record(hydra.core.model.Binding){
+        name = TermDefinition[name] td,
+        `term` = removeTypesFromTerm (TermDefinition[body] td),
+        typeScheme = none})
+      (termDefinitions m false),
+    body = removeTypesFromTerm x}}
 
-## Reduce a pure term with Hydra's own evaluator; the result must be a binary literal.
-term reducedBinary = λg:Graph, x:Term.
+## The error for an argument of writeStdout that reduces to something other than a binary literal.
+term notBinary = λr:Term.
+  eithers.left (strings.concat2 "hydraos.riscv.coder: argument of writeStdout did not reduce to a binary literal but to: " (describe r))
+
+## Reduce a pure term with Hydra's own evaluator, within its module; the result must be a binary
+## literal.
+term reducedBinary = λg:Graph, m:Module, x:Term.
   eithers.either
     (λe. eithers.left (strings.concat2 "hydraos.riscv.coder: reduction failed: " (printErrors.error e)))
-    (λr:Term. cases(hydra.core.model.Term){
-        literal = λl:Literal. cases(hydra.core.model.Literal){`binary` = λb:binary. eithers.right b, `_` = notBinary} l,
-        `_` = notBinary}
-      (deannotateAndDetypeTerm r))
-    (reduceTerm unit g true x)
+    (λr:Term.
+      let s := deannotateAndDetypeTerm r
+      in cases(hydra.core.model.Term){
+        literal = λl:Literal. cases(hydra.core.model.Literal){`binary` = λb:binary. eithers.right b, `_` = notBinary s} l,
+        `_` = notBinary s}
+      s)
+    (reduceTerm unit g true (withModuleBindings m x))
 
 ## The bytes main writes, if main is writeStdout applied to a pure argument.
-term writtenBytes = λg:Graph, body:Term.
+term writtenBytes = λg:Graph, m:Module, body:Term.
   let unsupported := eithers.left (strings.concat2 "hydraos.riscv.coder: unsupported in main: " (describe body))
   in cases(hydra.core.model.Term){
     application = λa:Application. cases(hydra.core.model.Term){
         variable = λn:Name. logic.ifElse (equality.equal (Name[] n) "hydra.core.lib.system.writeStdout")
-          (reducedBinary g (Application[argument] a))
+          (reducedBinary g m (Application[argument] a))
           unsupported,
         `_` = unsupported}
       (deannotateAndDetypeTerm (Application[function] a)),
@@ -96,7 +126,11 @@ term mainProgram = λbytes:binary.
 term compileModule = λg:Graph, m:Module.
   optionals.match (mainBody m)
     (eithers.left (strings.concat ["hydraos.riscv.coder: module ", ModuleName[] (Module[name] m), " has no term definition named main"]))
-    (λbody:Term. eithers.map mainProgram (writtenBytes g (deannotateAndDetypeTerm body)))
+    (λbody:Term. eithers.bind (writtenBytes g m (deannotateAndDetypeTerm body)) (λbytes:binary.
+      let count := lists.length (literals.binaryToBytes bytes)
+      in logic.ifElse (ordering.gt count 2047:int32)
+        (eithers.left (strings.concat ["hydraos.riscv.coder: main writes ", literals.printInt32 count, " bytes; this increment supports at most 2047"]))
+        (eithers.right (mainProgram bytes))))
 
 ## Compile and encode: the boot image for a module's main.
 term buildImage = λg:Graph, m:Module. eithers.bind (compileModule g m) encodeProgram

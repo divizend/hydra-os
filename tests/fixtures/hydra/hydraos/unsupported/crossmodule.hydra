@@ -1,0 +1,7 @@
+## Coder fixture: main's argument is defined in another module, which the coder does not see.
+module hydraos.unsupported.crossmodule
+
+import hydra.core.lib.system
+import hydraos.indirect
+
+term main = writeStdout greeting

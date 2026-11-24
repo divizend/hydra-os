@@ -24,7 +24,9 @@ hello.hydra            the kernel: main = writeStdout (encodeUtf8 "Hello from Hy
 ```
 
 Every byte of `out/hello.bin` is computed by Hydra code: no assembler, linker or C compiler is
-involved. `writeStdout` is the only place the two hosts differ. On bare metal it is the routine in
+involved. In this increment the coder accepts `main = writeStdout x` for any pure `x` of at most
+2047 bytes. `x` may use the module's other definitions, and Hydra's own evaluator computes it during
+the build. Anything else fails the build with an error that names the construct. `writeStdout` is the only place the two hosts differ. On bare metal it is the routine in
 `riscv/runtime.hydra`, which sends each byte to the serial port. The same `hello.hydra` also runs on
 Hydra's Python host, where `writeStdout` is Hydra's own implementation.
 

@@ -1,0 +1,10 @@
+## Coder fixture: main names a pure definition of its own module.
+module hydraos.indirect
+
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+## The greeting, as bytes.
+term greeting = encodeUtf8 "Hello from Hydra\n"
+
+term main = writeStdout greeting

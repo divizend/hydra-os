@@ -1,0 +1,11 @@
+## Coder fixture: main's message is computed by polymorphic library functions in another definition.
+module hydraos.computed
+
+import hydra.core.lib.lists as lists
+import hydra.core.lib.strings as strings
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+term greeting = strings.fromList (lists.concat2 (strings.toList "Hello from ") (strings.toList "Hydra\n"))
+
+term main = writeStdout (encodeUtf8 greeting)
