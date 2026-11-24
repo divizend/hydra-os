@@ -60,12 +60,13 @@ term registerNumber = λr:Register.
     (eithers.left (strings.concat ["register ", literals.printInt32 n, " out of range [0, 31]"]))
     (eithers.right (literals.int32ToBigint n))
 
-## The offset from pc to a label, checked to exist and to be 4-byte aligned.
-term targetOffset = λmnemonic:string, labels:map<string, int32>, pc:int32, target:Label.
+## The offset from pc to a label, checked to exist and, when aligned is true, to be 4-byte aligned:
+## branch and jump targets must be instructions, but la may address any byte.
+term targetOffset = λmnemonic:string, aligned:boolean, labels:map<string, int32>, pc:int32, target:Label.
   let name := Label[] target
   in optionals.match (maps.lookup name labels)
     (eithers.left (strings.concat [mnemonic, ": undefined label ", name]))
-    (λaddress:int32. logic.ifElse (equality.equal (modulo32 address 4:int32) 0:int32)
+    (λaddress:int32. logic.ifElse (logic.or (logic.not aligned) (equality.equal (modulo32 address 4:int32) 0:int32))
       (eithers.right (math.sub address pc))
       (eithers.left (strings.concat [mnemonic, ": target ", name, " at offset ", literals.printInt32 address, " is not 4-byte aligned"])))
 
@@ -144,18 +145,18 @@ term encodeInstruction = λlabels:map<string, int32>, pc:int32, instruction:Inst
     beq = λb:Branch. do either {
       rs1 := registerNumber (Branch[rs1] b),
       rs2 := registerNumber (Branch[rs2] b),
-      offset := targetOffset "beq" labels pc (Branch[target] b),
+      offset := targetOffset "beq" true labels pc (Branch[target] b),
       checked := checkRange "beq" "offset" offset -4096:int32 4094:int32,
       eithers.right (bFields checked rs2 rs1 0:int32 99:int32)},
     jal = λj:Jump. do either {
       rd := registerNumber (Jump[rd] j),
-      offset := targetOffset "jal" labels pc (Jump[target] j),
+      offset := targetOffset "jal" true labels pc (Jump[target] j),
       checked := checkRange "jal" "offset" offset -1048576:int32 1048574:int32,
       eithers.right (jFields checked rd 111:int32)},
     jalr = λi:IType. encodeI "jalr" 103:int32 0:int32 i,
     la = λl:LoadAddress. do either {
       rd := registerNumber (LoadAddress[rd] l),
-      offset := targetOffset "la" labels pc (LoadAddress[target] l),
+      offset := targetOffset "la" false labels pc (LoadAddress[target] l),
       checked := checkRange "la" "offset" offset -2147483648:int32 2147481599:int32,
       eithers.right (
         let hi := quotient (math.add checked 2048:bigint) 4096:bigint,

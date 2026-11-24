@@ -35,6 +35,8 @@ CASES = [  # (name, items, expected hex, objdump prefix)
      "17050000" "1305c503" + W * 13, ["auipc x10,0x0", "addi x10,x10,60"] + ["wfi"] * 13),
     ("la_far", lambda d: [d.la(d.a0, "far"), d.data(bytes(2040)), d.label("far")],
      "17150000" "13050580" + "00" * 2040, ["auipc x10,0x1", "addi x10,x10,-2048"]),
+    ("la_unaligned_target", lambda d: [d.la(d.a0, "msg"), d.data(b"x"), d.label("msg")],
+     "17050000" "13059500" "78", ["auipc x10,0x0", "addi x10,x10,9"]),
     ("data_verbatim", lambda d: [d.data(b"Hi")], "4869", []),
     ("empty_program", lambda d: [], "", []),
 ]
