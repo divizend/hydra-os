@@ -1,0 +1,7 @@
+## Coder fixture: main is a function, not an effect.
+module hydraos.unsupported.function
+
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+term main = λx:int32. writeStdout (encodeUtf8 "x")

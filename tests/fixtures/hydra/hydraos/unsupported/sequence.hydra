@@ -1,0 +1,8 @@
+## Coder fixture: main sequences two effects, which the coder doesn't compile yet.
+module hydraos.unsupported.sequence
+
+import hydra.core.lib.effects
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+term main = bind (writeStdout (encodeUtf8 "a")) (λr. writeStdout (encodeUtf8 "b"))

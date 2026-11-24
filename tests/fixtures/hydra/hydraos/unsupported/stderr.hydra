@@ -1,0 +1,7 @@
+## Coder fixture: main uses a primitive the RISC-V host doesn't implement.
+module hydraos.unsupported.stderr
+
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+term main = writeStderr (encodeUtf8 "x")

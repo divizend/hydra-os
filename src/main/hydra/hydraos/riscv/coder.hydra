@@ -1,0 +1,102 @@
+## The RISC-V coder: compile a Hydra module's main into a hydraos.riscv.model.Program.
+##
+## This increment supports exactly one shape: main = writeStdout x, where x is pure and Hydra's own
+## evaluator reduces it to a binary literal during the build. Anything else is rejected with an error
+## that names the construct. main tail-calls the runtime's writeStdout routine, because main's value
+## is writeStdout's value; the routine then returns straight to the start-up code, so no stack is
+## needed.
+module hydraos.riscv.coder
+
+import hydra.core.graph
+import hydra.core.model
+import hydra.core.packaging
+import hydra.core.print.errors as printErrors
+import hydra.core.print.variants as printVariants
+import hydra.core.reduction
+import hydra.core.reflect as reflect
+import hydra.core.strip
+import hydra.core.lib.eithers as eithers
+import hydra.core.lib.equality as equality
+import hydra.core.lib.lists as lists
+import hydra.core.lib.literals as literals
+import hydra.core.lib.logic as logic
+import hydra.core.lib.optionals as optionals
+import hydra.core.lib.strings as strings
+import hydraos.riscv.dsl
+import hydraos.riscv.encode
+import hydraos.riscv.model
+import hydraos.riscv.runtime
+
+## What a term is, for error messages: "application of <head>", "lambda", "variable <name>", or the
+## term's variant name.
+term describe = λt:Term.
+  cases(hydra.core.model.Term){
+    application = λa:Application. strings.concat2 "application of " (describeHead (Application[function] a)),
+    lambda = λl:Lambda. "lambda",
+    variable = λn:Name. strings.concat2 "variable " (Name[] n),
+    `_` = printVariants.termVariant (reflect.termVariant t)}
+  t
+
+## The head of an application spine: its name if it is a variable, otherwise its description.
+## Each node is stripped first: inference wraps a polymorphic head such as effects.bind in type
+## applications, which deannotateAndDetypeTerm removes only at the top of a term.
+term describeHead = λt:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    application = λa:Application. describeHead (Application[function] a),
+    variable = λn:Name. Name[] n,
+    `_` = describe s}
+  s
+
+## The body of the module's term definition named main, if there is one.
+term mainBody = λm:Module.
+  let mainName := strings.concat2 (ModuleName[] (Module[name] m)) ".main"
+  in lists.head (lists.concat (lists.map
+    (λd:Definition. cases(hydra.core.packaging.Definition){
+      `term` = λtd:TermDefinition. logic.ifElse (equality.equal (Name[] (TermDefinition[name] td)) mainName) [TermDefinition[body] td] [],
+      `_` = []} d)
+    (Module[definitions] m)))
+
+## The error for an argument of writeStdout that does not reduce to a binary literal.
+term notBinary = eithers.left "hydraos.riscv.coder: argument of writeStdout did not reduce to a binary literal"
+
+## Reduce a pure term with Hydra's own evaluator; the result must be a binary literal.
+term reducedBinary = λg:Graph, x:Term.
+  eithers.either
+    (λe. eithers.left (strings.concat2 "hydraos.riscv.coder: reduction failed: " (printErrors.error e)))
+    (λr:Term. cases(hydra.core.model.Term){
+        literal = λl:Literal. cases(hydra.core.model.Literal){`binary` = λb:binary. eithers.right b, `_` = notBinary} l,
+        `_` = notBinary}
+      (deannotateAndDetypeTerm r))
+    (reduceTerm unit g true x)
+
+## The bytes main writes, if main is writeStdout applied to a pure argument.
+term writtenBytes = λg:Graph, body:Term.
+  let unsupported := eithers.left (strings.concat2 "hydraos.riscv.coder: unsupported in main: " (describe body))
+  in cases(hydra.core.model.Term){
+    application = λa:Application. cases(hydra.core.model.Term){
+        variable = λn:Name. logic.ifElse (equality.equal (Name[] n) "hydra.core.lib.system.writeStdout")
+          (reducedBinary g (Application[argument] a))
+          unsupported,
+        `_` = unsupported}
+      (deannotateAndDetypeTerm (Application[function] a)),
+    `_` = unsupported}
+  body
+
+## The image for a main that writes the given bytes: start-up, main, the runtime routines, then
+## main's data.
+term mainProgram = λbytes:binary.
+  wrap(hydraos.riscv.model.Program){lists.concat [
+    startup,
+    [label "main", la a0 "main.message", addi a1 zero (lists.length (literals.binaryToBytes bytes)), jal zero "writeStdout"],
+    writeStdoutRoutine,
+    [label "main.message", data bytes]]}
+
+## Compile a module's main into a program.
+term compileModule = λg:Graph, m:Module.
+  optionals.match (mainBody m)
+    (eithers.left (strings.concat ["hydraos.riscv.coder: module ", ModuleName[] (Module[name] m), " has no term definition named main"]))
+    (λbody:Term. eithers.map mainProgram (writtenBytes g (deannotateAndDetypeTerm body)))
+
+## Compile and encode: the boot image for a module's main.
+term buildImage = λg:Graph, m:Module. eithers.bind (compileModule g m) encodeProgram

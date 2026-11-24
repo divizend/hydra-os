@@ -1,0 +1,7 @@
+## Coder fixture: a module with no main.
+module hydraos.unsupported.nomain
+
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+term greeting = writeStdout (encodeUtf8 "x")
