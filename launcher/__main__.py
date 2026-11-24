@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     args.source_root = args.source_root.resolve()
     try:
         args.handler(args)
-    except (HydraError, FileNotFoundError) as e:
+    except (HydraError, OSError) as e:  # OSError: unreadable sources, unwritable --out
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

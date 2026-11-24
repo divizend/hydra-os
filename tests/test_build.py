@@ -30,3 +30,11 @@ def test_committed_image_is_the_golden_image():
 def test_hello_bin_is_marked_binary_for_git():
     r = subprocess.run(["git", "check-attr", "binary", "--", "out/hello.bin"], cwd=REPO_ROOT, capture_output=True, text=True)
     assert r.stdout == "out/hello.bin: binary: set\n"
+
+
+def test_build_reports_an_unwritable_out_path(tmp_path):
+    r = run_launcher("build", "--out", str(tmp_path))  # an existing directory, not a file
+    err = r.stderr.decode()
+    assert r.returncode == 1
+    assert "error: " in err
+    assert "Traceback" not in err
