@@ -1,0 +1,7 @@
+## Pipeline probe: proves parse, infer, generate and import on the Python host.
+module hydraos.probe
+
+import hydra.core.lib.math
+
+## Double an integer.
+term double = λx:int32. add x x
