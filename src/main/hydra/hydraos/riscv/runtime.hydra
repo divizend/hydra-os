@@ -1,0 +1,41 @@
+## The runtime of the bare-metal RISC-V host, written as hydraos.riscv.model data: the start-up code
+## that runs from byte 0 of the image, and the native implementation of the primitive
+## hydra.core.lib.system.writeStdout.
+##
+## The primitive's Hydra result, either<SystemError, unit>, is not materialized: the start-up code
+## ignores main's result, so nothing ever reads it.
+module hydraos.riscv.runtime
+
+import hydraos.riscv.dsl
+
+## Byte 0 of the image. Call main; when it returns, store 0x5555 to QEMU's test device at
+## 0x0010_0000, which powers the machine off with exit status 0. If power-off ever fails, wait for
+## interrupts forever.
+term startup = [
+  jal ra "main",
+  lui t0 256:int32,
+  lui t1 5:int32,
+  addi t1 t1 1365:int32,
+  sw t1 t0 0:int32,
+  label "halt",
+  wfi,
+  jal zero "halt"]
+
+## writeStdout(a0 = address, a1 = length): send each byte to UART0, an NS16550A at 0x1000_0000,
+## first waiting until its line status register (offset 5) has THRE (bit 5) set.
+term writeStdoutRoutine = [
+  label "writeStdout",
+  lui t0 65536:int32,
+  label "writeStdout.loop",
+  beq a1 zero "writeStdout.done",
+  label "writeStdout.wait",
+  lbu t1 t0 5:int32,
+  andi t1 t1 32:int32,
+  beq t1 zero "writeStdout.wait",
+  lbu t2 a0 0:int32,
+  sb t2 t0 0:int32,
+  addi a0 a0 1:int32,
+  addi a1 a1 -1:int32,
+  jal zero "writeStdout.loop",
+  label "writeStdout.done",
+  jalr zero ra 0:int32]
