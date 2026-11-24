@@ -1,0 +1,8 @@
+## The kernel: print one line, on any Hydra host.
+module hydraos.hello
+
+import hydra.core.lib.system
+import hydra.core.lib.text
+
+## Print a greeting.
+term main = writeStdout (encodeUtf8 "Hello from Hydra\n")
