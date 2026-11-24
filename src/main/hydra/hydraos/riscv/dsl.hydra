@@ -1,0 +1,65 @@
+## Registers and item constructors for hydraos.riscv.model, so that programs read like assembly
+## listings. Arguments follow assembly operand order; stores take (source, base, offset).
+module hydraos.riscv.dsl
+
+import hydraos.riscv.model
+
+## x0, always zero.
+term zero = Register{0:int32}
+
+## x1, the return address.
+term ra = Register{1:int32}
+
+## x5, a temporary.
+term t0 = Register{5:int32}
+
+## x6, a temporary.
+term t1 = Register{6:int32}
+
+## x7, a temporary.
+term t2 = Register{7:int32}
+
+## x10, the first argument.
+term a0 = Register{10:int32}
+
+## x11, the second argument.
+term a1 = Register{11:int32}
+
+## Define a label at the current address.
+term label = λname:string. Item{label = wrap(hydraos.riscv.model.Label){name}}
+
+## Raw bytes, copied into the image unchanged.
+term data = λb:binary. Item{data = b}
+
+## addi rd, rs1, imm
+term addi = λrd:Register, rs1:Register, imm:int32. Item{instruction = Instruction{addi = IType{rd = rd, rs1 = rs1, imm = imm}}}
+
+## andi rd, rs1, imm
+term andi = λrd:Register, rs1:Register, imm:int32. Item{instruction = Instruction{andi = IType{rd = rd, rs1 = rs1, imm = imm}}}
+
+## jalr rd, imm(rs1)
+term jalr = λrd:Register, rs1:Register, imm:int32. Item{instruction = Instruction{jalr = IType{rd = rd, rs1 = rs1, imm = imm}}}
+
+## lbu rd, imm(rs1)
+term lbu = λrd:Register, rs1:Register, imm:int32. Item{instruction = Instruction{lbu = IType{rd = rd, rs1 = rs1, imm = imm}}}
+
+## sb src, imm(base)
+term sb = λsrc:Register, base:Register, imm:int32. Item{instruction = Instruction{sb = SType{rs1 = base, rs2 = src, imm = imm}}}
+
+## sw src, imm(base)
+term sw = λsrc:Register, base:Register, imm:int32. Item{instruction = Instruction{sw = SType{rs1 = base, rs2 = src, imm = imm}}}
+
+## lui rd, imm
+term lui = λrd:Register, imm:int32. Item{instruction = Instruction{lui = UType{rd = rd, imm = imm}}}
+
+## beq rs1, rs2, target
+term beq = λrs1:Register, rs2:Register, target:string. Item{instruction = Instruction{beq = Branch{rs1 = rs1, rs2 = rs2, target = wrap(hydraos.riscv.model.Label){target}}}}
+
+## jal rd, target
+term jal = λrd:Register, target:string. Item{instruction = Instruction{jal = Jump{rd = rd, target = wrap(hydraos.riscv.model.Label){target}}}}
+
+## la rd, target
+term la = λrd:Register, target:string. Item{instruction = Instruction{la = LoadAddress{rd = rd, target = wrap(hydraos.riscv.model.Label){target}}}}
+
+## wfi: wait for an interrupt.
+term wfi = Item{instruction = Instruction{wfi}}

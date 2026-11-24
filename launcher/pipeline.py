@@ -158,7 +158,7 @@ def parse_sources(kernel: Sequence[Module], sources: Sequence[tuple[str, str]]) 
 
 
 def kernel_graph(kernel: Sequence[Module]) -> Graph:
-    """The bootstrap graph with every kernel module folded in."""
+    """The bootstrap graph with the given kernel modules folded in."""
     return modules_to_graph(bootstrap_graph(), list(kernel), list(kernel))
 
 
@@ -246,11 +246,17 @@ def load_project(
     generated_dir: Path = GENERATED_DIR,
     cache_dir: Path = CACHE_DIR,
 ) -> Project:
-    """Load the kernel, then parse, infer and generate Python for every module under `source_roots`."""
+    """Load the kernel, then parse, infer and generate Python for every module under `source_roots`.
+
+    Inference and generation see only the kernel modules ours depend on. With the whole kernel in
+    scope, Hydra's Python-host inference takes about 14 s for twenty one-line definitions; with the
+    dependency closure it is near-instant, and the result is the same.
+    """
     kernel = load_kernel_modules(cache_dir)
     sources = [source for root in source_roots for source in find_sources(root)]
     parsed = parse_sources(kernel, sources)
-    graph = kernel_graph(kernel)
-    inferred = infer(graph, kernel, parsed)
-    generate_python(graph, kernel, inferred, generated_dir)
+    in_scope = dependency_closure(parsed, kernel)
+    graph = kernel_graph(in_scope)
+    inferred = infer(graph, in_scope, parsed)
+    generate_python(graph, in_scope, inferred, generated_dir)
     return Project(graph, kernel, {m.name.value: m for m in inferred}, Path(generated_dir))

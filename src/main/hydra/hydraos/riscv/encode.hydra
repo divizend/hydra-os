@@ -1,0 +1,246 @@
+## Encode a hydraos.riscv.model.Program as a flat RV64I image, little-endian.
+##
+## Pass 1 lays the items out: the offset of every label, checking that labels are unique and that
+## every instruction starts on a 4-byte boundary. Pass 2 encodes each item at its offset. Every
+## immediate and offset is range-checked; nothing is ever truncated. Instruction words are built
+## with bigint arithmetic, because Hydra has no bitwise primitives and a 32-bit word does not fit
+## in int32. Hydra has no primitive from bytes to binary, so the image goes through base64.
+module hydraos.riscv.encode
+
+import hydraos.riscv.model
+import hydra.core.lib.eithers as eithers
+import hydra.core.lib.equality as equality
+import hydra.core.lib.lists as lists
+import hydra.core.lib.literals as literals
+import hydra.core.lib.logic as logic
+import hydra.core.lib.maps as maps
+import hydra.core.lib.math as math
+import hydra.core.lib.optionals as optionals
+import hydra.core.lib.ordering as ordering
+import hydra.core.lib.pairs as pairs
+import hydra.core.lib.strings as strings
+
+## Floor division by a non-zero divisor (every divisor in this module is a positive constant).
+term quotient = λa:bigint, b:bigint. optionals.withDefault 0:bigint (math.div a b)
+
+## Floor-based remainder by a non-zero divisor; the result has the divisor's sign.
+term modulo = λa:bigint, b:bigint. optionals.withDefault 0:bigint (math.mod a b)
+
+## Floor division of int32 values by a non-zero divisor.
+term quotient32 = λa:int32, b:int32. optionals.withDefault 0:int32 (math.div a b)
+
+## Floor-based remainder of int32 values by a non-zero divisor.
+term modulo32 = λa:int32, b:int32. optionals.withDefault 0:int32 (math.mod a b)
+
+## 2 to the power n.
+term power2 = λn:int32. lists.foldl (λacc:bigint, u:unit. math.mul acc 2:bigint) 1:bigint (lists.replicate n unit)
+
+## v shifted left by n bits.
+term shifted = λv:bigint, n:int32. math.mul v (power2 n)
+
+## The width bits of a non-negative v starting at bit lo.
+term bitField = λv:bigint, lo:int32, width:int32. modulo (quotient v (power2 lo)) (power2 width)
+
+## The sum of a list of bigints.
+term sumOf = λxs:list<bigint>. lists.foldl (λa:bigint, b:bigint. math.add a b) 0:bigint xs
+
+## The 4 bytes of a 32-bit word, least significant first.
+term wordBytes = λw:bigint. lists.map (λshift:int32. literals.bigintToInt32 (bitField w shift 8:int32)) [0:int32, 8:int32, 16:int32, 24:int32]
+
+## v as a bigint if it lies in [lo, hi]; otherwise "<mnemonic>: <what> <v> out of range [<lo>, <hi>]".
+term checkRange = λmnemonic:string, what:string, v:int32, lo:int32, hi:int32.
+  logic.ifElse (logic.or (ordering.lt v lo) (ordering.gt v hi))
+    (eithers.left (strings.concat [mnemonic, ": ", what, " ", literals.printInt32 v, " out of range [", literals.printInt32 lo, ", ", literals.printInt32 hi, "]"]))
+    (eithers.right (literals.int32ToBigint v))
+
+## A register's number as a bigint, checked to lie in [0, 31].
+term registerNumber = λr:Register.
+  let n := Register[] r
+  in logic.ifElse (logic.or (ordering.lt n 0:int32) (ordering.gt n 31:int32))
+    (eithers.left (strings.concat ["register ", literals.printInt32 n, " out of range [0, 31]"]))
+    (eithers.right (literals.int32ToBigint n))
+
+## The offset from pc to a label, checked to exist and to be 4-byte aligned.
+term targetOffset = λmnemonic:string, labels:map<string, int32>, pc:int32, target:Label.
+  let name := Label[] target
+  in optionals.match (maps.lookup name labels)
+    (eithers.left (strings.concat [mnemonic, ": undefined label ", name]))
+    (λaddress:int32. logic.ifElse (equality.equal (modulo32 address 4:int32) 0:int32)
+      (eithers.right (math.sub address pc))
+      (eithers.left (strings.concat [mnemonic, ": target ", name, " at offset ", literals.printInt32 address, " is not 4-byte aligned"])))
+
+## An I-type word: imm[11:0] rs1 funct3 rd opcode.
+term iFields = λimm:bigint, rs1:bigint, funct3:int32, rd:bigint, opcode:int32.
+  wordBytes (sumOf [
+    shifted (modulo imm 4096:bigint) 20:int32,
+    shifted rs1 15:int32,
+    shifted (literals.int32ToBigint funct3) 12:int32,
+    shifted rd 7:int32,
+    literals.int32ToBigint opcode])
+
+## An S-type word: imm[11:5] rs2 rs1 funct3 imm[4:0] opcode.
+term sFields = λimm:bigint, rs2:bigint, rs1:bigint, funct3:int32, opcode:int32.
+  let imm12 := modulo imm 4096:bigint
+  in wordBytes (sumOf [
+    shifted (quotient imm12 32:bigint) 25:int32,
+    shifted rs2 20:int32,
+    shifted rs1 15:int32,
+    shifted (literals.int32ToBigint funct3) 12:int32,
+    shifted (modulo imm12 32:bigint) 7:int32,
+    literals.int32ToBigint opcode])
+
+## A B-type word: imm[12|10:5] rs2 rs1 funct3 imm[4:1|11] opcode.
+term bFields = λoffset:bigint, rs2:bigint, rs1:bigint, funct3:int32, opcode:int32.
+  let o := modulo offset 8192:bigint
+  in wordBytes (sumOf [
+    shifted (bitField o 12:int32 1:int32) 31:int32,
+    shifted (bitField o 5:int32 6:int32) 25:int32,
+    shifted rs2 20:int32,
+    shifted rs1 15:int32,
+    shifted (literals.int32ToBigint funct3) 12:int32,
+    shifted (bitField o 1:int32 4:int32) 8:int32,
+    shifted (bitField o 11:int32 1:int32) 7:int32,
+    literals.int32ToBigint opcode])
+
+## A U-type word: imm[31:12] rd opcode.
+term uFields = λimm20:bigint, rd:bigint, opcode:int32.
+  wordBytes (sumOf [
+    shifted (modulo imm20 1048576:bigint) 12:int32,
+    shifted rd 7:int32,
+    literals.int32ToBigint opcode])
+
+## A J-type word: imm[20|10:1|11|19:12] rd opcode.
+term jFields = λoffset:bigint, rd:bigint, opcode:int32.
+  let o := modulo offset 2097152:bigint
+  in wordBytes (sumOf [
+    shifted (bitField o 20:int32 1:int32) 31:int32,
+    shifted (bitField o 1:int32 10:int32) 21:int32,
+    shifted (bitField o 11:int32 1:int32) 20:int32,
+    shifted (bitField o 12:int32 8:int32) 12:int32,
+    shifted rd 7:int32,
+    literals.int32ToBigint opcode])
+
+## Encode an I-type instruction (addi, andi, jalr, lbu).
+term encodeI = λmnemonic:string, opcode:int32, funct3:int32, i:IType.
+  do either {
+    rd := registerNumber (IType[rd] i),
+    rs1 := registerNumber (IType[rs1] i),
+    imm := checkRange mnemonic "immediate" (IType[imm] i) -2048:int32 2047:int32,
+    eithers.right (iFields imm rs1 funct3 rd opcode)}
+
+## Encode an S-type store (sb, sw).
+term encodeS = λmnemonic:string, funct3:int32, s:SType.
+  do either {
+    base := registerNumber (SType[rs1] s),
+    src := registerNumber (SType[rs2] s),
+    imm := checkRange mnemonic "immediate" (SType[imm] s) -2048:int32 2047:int32,
+    eithers.right (sFields imm src base funct3 35:int32)}
+
+## Encode one instruction placed at offset pc.
+term encodeInstruction = λlabels:map<string, int32>, pc:int32, instruction:Instruction.
+  cases(hydraos.riscv.model.Instruction){
+    addi = λi:IType. encodeI "addi" 19:int32 0:int32 i,
+    andi = λi:IType. encodeI "andi" 19:int32 7:int32 i,
+    beq = λb:Branch. do either {
+      rs1 := registerNumber (Branch[rs1] b),
+      rs2 := registerNumber (Branch[rs2] b),
+      offset := targetOffset "beq" labels pc (Branch[target] b),
+      checked := checkRange "beq" "offset" offset -4096:int32 4094:int32,
+      eithers.right (bFields checked rs2 rs1 0:int32 99:int32)},
+    jal = λj:Jump. do either {
+      rd := registerNumber (Jump[rd] j),
+      offset := targetOffset "jal" labels pc (Jump[target] j),
+      checked := checkRange "jal" "offset" offset -1048576:int32 1048574:int32,
+      eithers.right (jFields checked rd 111:int32)},
+    jalr = λi:IType. encodeI "jalr" 103:int32 0:int32 i,
+    la = λl:LoadAddress. do either {
+      rd := registerNumber (LoadAddress[rd] l),
+      offset := targetOffset "la" labels pc (LoadAddress[target] l),
+      checked := checkRange "la" "offset" offset -2147483648:int32 2147481599:int32,
+      eithers.right (
+        let hi := quotient (math.add checked 2048:bigint) 4096:bigint,
+            lo := math.sub checked (math.mul hi 4096:bigint)
+        in lists.concat2 (uFields hi rd 23:int32) (iFields lo rd 0:int32 rd 19:int32))},
+    lbu = λi:IType. encodeI "lbu" 3:int32 4:int32 i,
+    lui = λu:UType. do either {
+      rd := registerNumber (UType[rd] u),
+      imm := checkRange "lui" "immediate" (UType[imm] u) 0:int32 1048575:int32,
+      eithers.right (uFields imm rd 55:int32)},
+    sb = λs:SType. encodeS "sb" 0:int32 s,
+    sw = λs:SType. encodeS "sw" 2:int32 s,
+    wfi = λ`_`. eithers.right (wordBytes 273678451:bigint)}
+  instruction
+
+## The size of an item in the image, in bytes.
+term itemSize = λitem:Item.
+  cases(hydraos.riscv.model.Item){
+    label = λl:Label. 0:int32,
+    instruction = λi:Instruction. cases(hydraos.riscv.model.Instruction){la = λl:LoadAddress. 8:int32, `_` = 4:int32} i,
+    data = λb:binary. lists.length (literals.binaryToBytes b)}
+  item
+
+## One layout step: (offset, labels so far) and an item give the next (offset, labels).
+term layoutStep = λstate:(int32, map<string, int32>), item:Item.
+  let offset := pairs.first state,
+      labels := pairs.second state,
+      next := math.add offset (itemSize item)
+  in cases(hydraos.riscv.model.Item){
+    label = λl:Label. logic.ifElse (maps.member (Label[] l) labels)
+      (eithers.left (strings.concat ["duplicate label ", Label[] l]))
+      (eithers.right (offset, maps.insert (Label[] l) offset labels)),
+    instruction = λi:Instruction. logic.ifElse (equality.equal (modulo32 offset 4:int32) 0:int32)
+      (eithers.right (next, labels))
+      (eithers.left (strings.concat ["instruction at offset ", literals.printInt32 offset, " is not 4-byte aligned"])),
+    data = λb:binary. eithers.right (next, labels)}
+  item
+
+## Pass 1: the offset of every label.
+term layout = λitems:list<Item>.
+  eithers.map (λstate:(int32, map<string, int32>). pairs.second state) (eithers.foldList layoutStep (0:int32, maps.empty) items)
+
+## One encoding step: (offset, byte chunks so far, newest first) and an item give the next state.
+term encodeStep = λlabels:map<string, int32>, state:(int32, list<list<int32>>), item:Item.
+  let offset := pairs.first state,
+      chunks := pairs.second state,
+      next := math.add offset (itemSize item)
+  in eithers.map (λbytes:list<int32>. (next, lists.cons bytes chunks))
+    (cases(hydraos.riscv.model.Item){
+      label = λl:Label. eithers.right [],
+      instruction = λi:Instruction. encodeInstruction labels offset i,
+      data = λb:binary. eithers.right (literals.binaryToBytes b)}
+    item)
+
+## The base64 character code (standard alphabet) of a 6-bit value.
+term base64Char = λv:int32.
+  logic.ifElse (ordering.lt v 26:int32) (math.add 65:int32 v)
+    (logic.ifElse (ordering.lt v 52:int32) (math.add 71:int32 v)
+      (logic.ifElse (ordering.lt v 62:int32) (math.sub v 4:int32)
+        (logic.ifElse (equality.equal v 62:int32) 43:int32 47:int32)))
+
+## The 4 base64 characters of a group of 1 to 3 bytes; a short group is padded with "=".
+term base64Group = λgroup:list<int32>.
+  let count := lists.length group,
+      n := lists.foldl (λacc:int32, b:int32. math.add (math.mul acc 256:int32) b) 0:int32 (lists.take 3:int32 (lists.concat2 group [0:int32, 0:int32])),
+      chars := lists.map (λd:int32. base64Char (modulo32 (quotient32 n d) 64:int32)) [262144:int32, 4096:int32, 64:int32, 1:int32]
+  in strings.concat2 (strings.fromList (lists.take (math.add count 1:int32) chars)) (strings.fromList (lists.replicate (math.sub 3:int32 count) 61:int32))
+
+## One base64 step: (pending bytes, finished groups newest first) and a byte give the next state.
+term base64Step = λstate:(list<int32>, list<string>), b:int32.
+  let group := lists.concat2 (pairs.first state) [b]
+  in logic.ifElse (equality.equal (lists.length group) 3:int32)
+    ([], lists.cons (base64Group group) (pairs.second state))
+    (group, pairs.second state)
+
+## Standard, padded base64 of a list of bytes.
+term base64 = λbytes:list<int32>.
+  let final := lists.foldl base64Step ([], []) bytes,
+      rest := pairs.first final
+  in strings.concat (lists.concat2 (lists.reverse (pairs.second final)) (logic.ifElse (lists.isEmpty rest) [] [base64Group rest]))
+
+## Encode a program as a flat little-endian image, or report the first problem found.
+term encodeProgram = λp:Program.
+  let items := Program[] p
+  in do either {
+    labels := layout items,
+    final := eithers.foldList (encodeStep labels) (0:int32, []) items,
+    eithers.right (literals.base64ToBinary (base64 (lists.concat (lists.reverse (pairs.second final)))))}

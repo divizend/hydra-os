@@ -1,0 +1,55 @@
+## The RISC-V instructions this project emits (RV64I), as Hydra types.
+##
+## Source of truth: The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA, document version
+## 20191213 (https://github.com/riscv/riscv-isa-manual/releases/download/Ratified-IMAFDQC/riscv-spec-20191213.pdf),
+## and Volume II: Privileged Architecture, document version 20211203, for wfi
+## (https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf).
+module hydraos.riscv.model
+
+## An integer register x0..x31, by number.
+type Register = wrap(int32)
+
+## A symbolic address of an instruction or data byte in the image.
+type Label = wrap(string)
+
+## rd ← f(rs1, imm); imm in [-2048, 2047]. Used by addi, andi, jalr, lbu.
+type IType = record{rd: Register, rs1: Register, imm: int32}
+
+## memory[rs1 + imm] ← rs2; imm in [-2048, 2047]. Used by sb, sw.
+type SType = record{rs1: Register, rs2: Register, imm: int32}
+
+## rd ← imm << 12; imm in [0, 1048575]. Used by lui.
+type UType = record{rd: Register, imm: int32}
+
+## If rs1 = rs2, continue at target.
+type Branch = record{rs1: Register, rs2: Register, target: Label}
+
+## rd ← address of the next instruction; continue at target.
+type Jump = record{rd: Register, target: Label}
+
+## The la pseudo-instruction: rd ← address of target, always auipc + addi (8 bytes).
+type LoadAddress = record{rd: Register, target: Label}
+
+type Instruction = union{
+  addi: IType,
+  andi: IType,
+  beq: Branch,
+  jal: Jump,
+  jalr: IType,
+  la: LoadAddress,
+  lbu: IType,
+  lui: UType,
+  sb: SType,
+  sw: SType,
+  wfi: unit}
+
+# A label definition (0 bytes), an instruction (4 bytes; la is 8), or raw data bytes.
+# (A plain comment, not a ## doc comment: Hydra 0.18.1's Name{field = ...} shorthand reads a union
+# that carries a ## doc comment as a record, so every Item{...} would fail inference.)
+type Item = union{
+  label: Label,
+  instruction: Instruction,
+  data: binary}
+
+## A flat image: the items in order, starting at offset 0.
+type Program = wrap(list<Item>)
