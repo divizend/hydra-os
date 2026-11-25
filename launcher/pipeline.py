@@ -33,6 +33,7 @@ from hydra.core.json import model as json_model  # noqa: E402
 from hydra.core.lexical import empty_inference_context  # noqa: E402
 from hydra.core.model import Name, TypeVariable  # noqa: E402
 from hydra.core.overlay.python.dsl.python import FrozenDict, Left  # noqa: E402
+from hydra.core.overlay.python.util.cons_list import ConsList  # noqa: E402
 from hydra.core.overlay.python.sources.libraries import standard_library  # noqa: E402
 from hydra.core.packaging import Module  # noqa: E402
 from hydra.core.parse.packaging import parse_modules  # noqa: E402
@@ -225,12 +226,17 @@ def _overlay_lib_subs() -> frozenset[str]:
 
 @dataclass
 class Project:
-    """Our modules, inferred, with the Python generated from them."""
+    """Our modules, inferred, with the Python generated from them and the text each was parsed from."""
 
     graph: Graph
     kernel: list[Module]
     modules: dict[str, Module]
     generated_dir: Path
+    texts: dict[str, tuple[str, str]]  # module name -> (display path, text)
+
+    def sources(self) -> ConsList:
+        """Our modules as the list of sources the coder reads its program from."""
+        return ConsList.of(*self.modules.values())
 
     def module(self, namespace: str) -> types.ModuleType:
         """Import the Python generated for a Hydra module, e.g. `hydraos.hello`."""
@@ -259,4 +265,5 @@ def load_project(
     graph = kernel_graph(in_scope)
     inferred = infer(graph, in_scope, parsed)
     generate_python(graph, in_scope, inferred, generated_dir)
-    return Project(graph, kernel, {m.name.value: m for m in inferred}, Path(generated_dir))
+    texts = {m.name.value: source for source, m in zip(sources, parsed, strict=True)}  # parse_modules keeps the order
+    return Project(graph, kernel, {m.name.value: m for m in inferred}, Path(generated_dir), texts)
