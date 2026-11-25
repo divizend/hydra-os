@@ -1,0 +1,184 @@
+## Programs read as data: a definition's body found among modules, the calls of an item list with the path
+## of each inside its definition, and each call's arguments with the field of the item each one fills, read
+## from the constructor's own definition.
+##
+## Paths are taken on terms as written. Annotations, and the type abstractions and type applications that
+## inference adds, are passed through without a step, so a path resolves against the parsed source with
+## hydra.core.positions.spanAtPath.
+module hydraos.riscv.sources
+
+import hydra.core.model
+import hydra.core.packaging
+import hydra.core.paths
+import hydra.core.print.paths as printPaths
+import hydra.core.print.variants as printVariants
+import hydra.core.reflect as reflect
+import hydra.core.strip
+import hydraos.riscv.derivation
+import hydraos.riscv.derive
+import hydra.core.lib.eithers as eithers
+import hydra.core.lib.equality as equality
+import hydra.core.lib.lists as lists
+import hydra.core.lib.literals as literals
+import hydra.core.lib.logic as logic
+import hydra.core.lib.optionals as optionals
+import hydra.core.lib.pairs as pairs
+import hydra.core.lib.strings as strings
+
+## What a term is, for error messages: "application of <head>", "lambda", "variable <name>", or the
+## term's variant name.
+term describe = λt:Term.
+  cases(hydra.core.model.Term){
+    application = λa:Application. strings.concat2 "application of " (describeHead (Application[function] a)),
+    lambda = λl:Lambda. "lambda",
+    variable = λn:Name. strings.concat2 "variable " (Name[] n),
+    `_` = printVariants.termVariant (reflect.termVariant t)}
+  t
+
+## The head of an application spine: its name if it is a variable, otherwise its description.
+## Each node is stripped first: inference wraps a polymorphic head such as effects.bind in type
+## applications, which deannotateAndDetypeTerm removes only at the top of a term.
+term describeHead = λt:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    application = λa:Application. describeHead (Application[function] a),
+    variable = λn:Name. Name[] n,
+    `_` = describe s}
+  s
+
+## The body of the term definition called name in one of the modules, if there is one.
+term definitionIn = λmodules:list<Module>, name:string.
+  lists.head (lists.concat (lists.map
+    (λm:Module. lists.concat (lists.map
+      (λd:Definition. cases(hydra.core.packaging.Definition){
+        `term` = λtd:TermDefinition. logic.ifElse (equality.equal (Name[] (TermDefinition[name] td)) name) [TermDefinition[body] td] [],
+        `_` = []}
+        d)
+      (Module[definitions] m)))
+    modules))
+
+## The step from an application to its argument.
+term stepArgument = inject(hydra.core.paths.SubtermStep){applicationArgument = unit}
+
+## The step from an application to its function.
+term stepFunction = inject(hydra.core.paths.SubtermStep){applicationFunction = unit}
+
+## The step from a lambda to its body.
+term stepLambda = inject(hydra.core.paths.SubtermStep){lambdaBody = unit}
+
+## The step from a wrapped term to its body.
+term stepWrap = inject(hydra.core.paths.SubtermStep){wrapBody = unit}
+
+## The step from a list to its element i.
+term stepElement = λi:int32. inject(hydra.core.paths.SubtermStep){listElement = i}
+
+## The place of the subterm at steps inside a definition.
+term placeAt = λdefinition:string, steps:list<SubtermStep>.
+  SourcePlace{definition = definition, path = wrap(hydra.core.paths.SubtermPath){steps}, character = none}
+
+## A place as text: its definition and its path, as in hydraos.riscv.runtime.startup#listElement:1.
+term placeText = λp:SourcePlace. strings.concat [SourcePlace[definition] p, "#", printPaths.subtermPath (SourcePlace[path] p)]
+
+## Whether a term, without its annotations and types, is the variable called name.
+term isVariable = λname:string, t:Term.
+  cases(hydra.core.model.Term){variable = λn:Name. equality.equal (Name[] n) name, `_` = false}
+  (deannotateAndDetypeTerm t)
+
+## The calls of the item list written at steps inside definition: a list of calls, lists.concat applied to
+## a list of item lists, or a variable that names a definition among the modules whose body is an item list.
+term callsIn = λmodules:list<Module>, definition:string, steps:list<SubtermStep>, t:Term.
+  let s := deannotateAndDetypeTerm t,
+      unsupported := eithers.left (strings.concat ["hydraos.riscv.sources: expected an item list at ", placeText (placeAt definition steps), ", found ", describe s])
+  in cases(hydra.core.model.Term){
+    `list` = λxs:list<Term>. eithers.mapList
+      (λix:(int32, Term). callAt modules definition (lists.concat2 steps [stepElement (pairs.first ix)]) (pairs.second ix))
+      (numbered xs),
+    application = λa:Application. logic.ifElse (isVariable "hydra.core.lib.lists.concat" (Application[function] a))
+      (cases(hydra.core.model.Term){
+          `list` = λxs:list<Term>. eithers.map (λcs:list<list<Call>>. lists.concat cs) (eithers.mapList
+            (λix:(int32, Term). callsIn modules definition (lists.concat [steps, [stepArgument, stepElement (pairs.first ix)]]) (pairs.second ix))
+            (numbered xs)),
+          `_` = unsupported}
+        (deannotateAndDetypeTerm (Application[argument] a)))
+      unsupported,
+    variable = λn:Name. optionals.match (definitionIn modules (Name[] n))
+      (eithers.left (strings.concat ["hydraos.riscv.sources: no definition ", Name[] n, " among the sources"]))
+      (λbody:Term. callsIn modules (Name[] n) [] body),
+    `_` = unsupported}
+  s
+
+## The head of an application spine, and its arguments in order, each with its steps from the spine.
+term spine = λsteps:list<SubtermStep>, t:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    application = λa:Application.
+      let inner := spine (lists.concat2 steps [stepFunction]) (Application[function] a)
+      in (pairs.first inner, lists.concat2 (pairs.second inner) [(lists.concat2 steps [stepArgument], Application[argument] a)]),
+    `_` = (s, [])}
+  s
+
+## The parameters of a function, and its body under them.
+term parameters = λt:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    lambda = λl:Lambda.
+      let inner := parameters (Lambda[body] l)
+      in (lists.cons (Name[] (Lambda[parameter] l)) (pairs.first inner), pairs.second inner),
+    `_` = ([], s)}
+  s
+
+## Whether a term is the variable called name, or that variable wrapped (as a label's name is).
+term isParameter = λname:string, t:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    variable = λn:Name. equality.equal (Name[] n) name,
+    `wrap` = λw:WrappedTerm. isParameter name (WrappedTerm[body] w),
+    `_` = false}
+  s
+
+## The field that holds the parameter called p in the item a constructor's body builds: the field of a
+## record or of an injection whose value is that parameter.
+term fieldOf = λp:string, t:Term.
+  let inField := λf:Field. logic.ifElse (isParameter p (Field[`term`] f)) (given(Name[] (Field[name] f))) (fieldOf p (Field[`term`] f)),
+      s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    `record` = λr:Record. lists.head (optionals.givens (lists.map inField (Record[fields] r))),
+    `inject` = λi:Injection. inField (Injection[field] i),
+    `wrap` = λw:WrappedTerm. fieldOf p (WrappedTerm[body] w),
+    `_` = none}
+  s
+
+## The variant a constructor's body builds: the innermost field of its chain of injections (an
+## instruction's mnemonic, label or data).
+term variantOf = λt:Term.
+  cases(hydra.core.model.Term){
+    `inject` = λi:Injection. given(optionals.withDefault (Name[] (Field[name] (Injection[field] i))) (variantOf (Field[`term`] (Injection[field] i)))),
+    `_` = none}
+  (deannotateAndDetypeTerm t)
+
+## The call written at steps inside definition: a variable that names an item constructor among the
+## modules, applied to one argument for each of its parameters.
+term callAt = λmodules:list<Module>, definition:string, steps:list<SubtermStep>, t:Term.
+  let place := placeAt definition steps,
+      sp := spine steps t,
+      arguments := pairs.second sp,
+      at := strings.concat2 " at " (placeText place)
+  in cases(hydra.core.model.Term){
+    variable = λn:Name. optionals.match (definitionIn modules (Name[] n))
+      (eithers.left (strings.concat ["hydraos.riscv.sources: no definition ", Name[] n, " among the sources", at]))
+      (λbody:Term.
+        let ps := parameters body
+        in optionals.match (variantOf (pairs.second ps))
+          (eithers.left (strings.concat ["hydraos.riscv.sources: ", Name[] n, " does not build an item", at]))
+          (λbuilds:string. logic.ifElse (equality.equal (lists.length (pairs.first ps)) (lists.length arguments))
+            (eithers.map
+              (λxs:list<Argument>. Call{place = place, constructor = Name[] n, builds = builds, arguments = xs})
+              (eithers.mapList
+                (λpa:(string, (list<SubtermStep>, Term)). optionals.match (fieldOf (pairs.first pa) (pairs.second ps))
+                  (eithers.left (strings.concat ["hydraos.riscv.sources: no field of the item ", Name[] n, " builds holds its parameter ", pairs.first pa]))
+                  (λfield:string. eithers.right (Argument{field = field, path = wrap(hydra.core.paths.SubtermPath){pairs.first (pairs.second pa)}, written = pairs.second (pairs.second pa)})))
+                (lists.zip (pairs.first ps) arguments)))
+            (eithers.left (strings.concat ["hydraos.riscv.sources: ", Name[] n, " takes ", literals.printInt32 (lists.length (pairs.first ps)), " arguments, but ",
+              literals.printInt32 (lists.length arguments), " are given", at])))),
+    `_` = eithers.left (strings.concat ["hydraos.riscv.sources: expected a call of an item constructor, found ", describe (pairs.first sp), at])}
+  (deannotateAndDetypeTerm (pairs.first sp))

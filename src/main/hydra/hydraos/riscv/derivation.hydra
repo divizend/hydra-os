@@ -3,6 +3,7 @@
 ## that step.
 module hydraos.riscv.derivation
 
+import hydra.core.model
 import hydra.core.paths
 import hydraos.riscv.model
 
@@ -85,3 +86,11 @@ type Slot = record{field: string, lo: int32, width: int32, formula: Formula}
 
 ## The atoms recorded so far, newest first, and their values by id.
 type Recording = record{values: map<string, Value>, atoms: list<Atom>}
+
+## One argument of a call: the field of the item it fills, its path inside the call's definition, and the
+## term written there.
+type Argument = record{field: string, path: SubtermPath, written: Term}
+
+## A call of an item constructor, written in a source: where, the constructor's definition, the variant of
+## the item that constructor builds (an instruction's mnemonic, label or data), and the arguments in order.
+type Call = record{place: SourcePlace, constructor: string, builds: string, arguments: list<Argument>}

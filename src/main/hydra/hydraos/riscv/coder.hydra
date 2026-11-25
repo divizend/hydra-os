@@ -1,4 +1,5 @@
-## The RISC-V coder: compile a Hydra module's main into a hydraos.riscv.model.Program.
+## The RISC-V coder: compile a Hydra module's main into a hydraos.riscv.model.Program, and trace where every
+## part of that program came from.
 ##
 ## This increment supports exactly one shape: main = writeStdout x, where x is pure, may use the
 ## module's other definitions, reduces to a binary literal during the build, and is at most 2047
@@ -6,49 +7,39 @@
 ## that names the construct. main tail-calls the runtime's writeStdout routine, because main's value
 ## is writeStdout's value; the routine then returns straight to the start-up code, so no stack is
 ## needed.
+##
+## The trace reads the sources as data (hydraos.riscv.sources): the message from main's own module, and the
+## items from this module's mainProgram, the runtime and the DSL. Hydra 0.18.1's evaluator drops the
+## annotations of call-site arguments when it reduces, so origins cannot ride through evaluation; instead
+## every traced value is checked against the program Hydra evaluated, and a disagreement fails the build.
 module hydraos.riscv.coder
 
 import hydra.core.graph
 import hydra.core.model
 import hydra.core.packaging
+import hydra.core.paths
 import hydra.core.print.errors as printErrors
-import hydra.core.print.variants as printVariants
 import hydra.core.reduction
-import hydra.core.reflect as reflect
 import hydra.core.strip
 import hydra.core.lib.eithers as eithers
 import hydra.core.lib.equality as equality
 import hydra.core.lib.lists as lists
 import hydra.core.lib.literals as literals
 import hydra.core.lib.logic as logic
+import hydra.core.lib.maps as maps
+import hydra.core.lib.math as math
 import hydra.core.lib.optionals as optionals
 import hydra.core.lib.ordering as ordering
+import hydra.core.lib.pairs as pairs
 import hydra.core.lib.strings as strings
+import hydra.core.lib.text as text
+import hydraos.riscv.derivation
+import hydraos.riscv.derive
 import hydraos.riscv.dsl
 import hydraos.riscv.encode
 import hydraos.riscv.model
 import hydraos.riscv.runtime
-
-## What a term is, for error messages: "application of <head>", "lambda", "variable <name>", or the
-## term's variant name.
-term describe = λt:Term.
-  cases(hydra.core.model.Term){
-    application = λa:Application. strings.concat2 "application of " (describeHead (Application[function] a)),
-    lambda = λl:Lambda. "lambda",
-    variable = λn:Name. strings.concat2 "variable " (Name[] n),
-    `_` = printVariants.termVariant (reflect.termVariant t)}
-  t
-
-## The head of an application spine: its name if it is a variable, otherwise its description.
-## Each node is stripped first: inference wraps a polymorphic head such as effects.bind in type
-## applications, which deannotateAndDetypeTerm removes only at the top of a term.
-term describeHead = λt:Term.
-  let s := deannotateAndDetypeTerm t
-  in cases(hydra.core.model.Term){
-    application = λa:Application. describeHead (Application[function] a),
-    variable = λn:Name. Name[] n,
-    `_` = describe s}
-  s
+import hydraos.riscv.sources
 
 ## The full name of a module's main, e.g. hydraos.hello.main.
 term mainName = λm:Module. strings.concat2 (ModuleName[] (Module[name] m)) ".main"
@@ -122,15 +113,318 @@ term mainProgram = λbytes:binary.
     writeStdoutRoutine,
     [label "main.message", data bytes]]}
 
-## Compile a module's main into a program.
-term compileModule = λg:Graph, m:Module.
+## The bytes main writes, if main is writeStdout applied to a pure argument and the bytes fit the length
+## main loads with a single addi.
+term compiledBytes = λg:Graph, m:Module.
   optionals.match (mainBody m)
     (eithers.left (strings.concat ["hydraos.riscv.coder: module ", ModuleName[] (Module[name] m), " has no term definition named main"]))
     (λbody:Term. eithers.bind (writtenBytes g m (deannotateAndDetypeTerm body)) (λbytes:binary.
       let count := lists.length (literals.binaryToBytes bytes)
       in logic.ifElse (ordering.gt count 2047:int32)
         (eithers.left (strings.concat ["hydraos.riscv.coder: main writes ", literals.printInt32 count, " bytes; this increment supports at most 2047"]))
-        (eithers.right (mainProgram bytes))))
+        (eithers.right bytes)))
+
+## Compile a module's main into a program.
+term compileModule = λg:Graph, m:Module. eithers.map mainProgram (compiledBytes g m)
+
+## The definition whose source the trace reads the program's items from.
+term mainProgramName = "hydraos.riscv.coder.mainProgram"
+
+## A place in a source, as a Place.
+term inSource = λp:SourcePlace. inject(hydraos.riscv.derivation.Place){source = p}
+
+## The id of the atom written at a place: source/<definition>#<path>.
+term sourceKey = λp:SourcePlace. strings.concat2 "source/" (placeText p)
+
+## The id of byte k of the message.
+term messageKey = λk:int32. strings.concat2 "message/" (literals.printInt32 k)
+
+## Where a string is written: the place of a string literal, reached directly or through definitions of m,
+## and the string.
+term stringIn = λm:Module, definition:string, steps:list<SubtermStep>, t:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    literal = λl:Literal. cases(hydra.core.model.Literal){`string` = λx:string. given((placeAt definition steps, x)), `_` = none} l,
+    variable = λn:Name. optionals.bind (definitionIn [m] (Name[] n)) (λbody:Term. stringIn m (Name[] n) [] body),
+    `_` = none}
+  s
+
+## Where the message is written, when it is encodeUtf8 applied to a string, directly or through
+## definitions of m.
+term messageString = λm:Module, definition:string, steps:list<SubtermStep>, t:Term.
+  let s := deannotateAndDetypeTerm t
+  in cases(hydra.core.model.Term){
+    application = λa:Application. logic.ifElse (isVariable "hydra.core.lib.text.encodeUtf8" (Application[function] a))
+      (stringIn m definition (lists.concat2 steps [stepArgument]) (Application[argument] a))
+      none,
+    variable = λn:Name. optionals.bind (definitionIn [m] (Name[] n)) (λbody:Term. messageString m (Name[] n) [] body),
+    `_` = none}
+  s
+
+## Every traced byte of the message must be the byte Hydra evaluated.
+term checkMessage = λdefinition:string, r:Recording, ids:list<AtomId>, evaluated:list<int32>.
+  let where := strings.concat2 " of the message traced to " definition
+  in logic.ifElse (equality.equal (lists.length ids) (lists.length evaluated))
+    (eithers.foldList
+      (λu:unit, kib:(int32, (AtomId, int32)).
+        let k := pairs.first kib,
+            b := pairs.second (pairs.second kib)
+        in eithers.bind (numberIn r (AtomId[] (pairs.first (pairs.second kib)))) (λv:bigint.
+          logic.ifElse (equality.equal v (literals.int32ToBigint b))
+            (eithers.right unit)
+            (eithers.left (strings.concat ["hydraos.riscv.coder: byte ", literals.printInt32 k, where, " is ", literals.printBigint v, ", but Hydra evaluated ", literals.printInt32 b]))))
+      unit
+      (numbered (lists.zip ids evaluated)))
+    (eithers.left (strings.concat ["hydraos.riscv.coder: the message traced to ", definition, " has ", literals.printInt32 (lists.length ids), " bytes, but Hydra evaluated ", literals.printInt32 (lists.length evaluated)]))
+
+## The message traced per character of the string written at a place: a stated atom per character, placed
+## on it in the literal, then an atom per byte of the character's UTF-8 encoding.
+term perCharacter = λwritten:(SourcePlace, string), evaluated:list<int32>, r:Recording.
+  let place := pairs.first written,
+      definition := SourcePlace[definition] place,
+      charKey := λi:int32. strings.concat [definition, "/char/", literals.printInt32 i],
+      character := λacc:(Recording, (int32, list<AtomId>)), ic:(int32, int32).
+        let i := pairs.first ic,
+            c := pairs.second ic,
+            r1 := addStated (pairs.first acc) (charKey i)
+              (inSource (SourcePlace{definition = definition, path = SourcePlace[path] place, character = given(i)}))
+              (number (literals.int32ToBigint c))
+              (Rule{definition = definition, detail = strings.concat2 "character " (literals.printInt32 i)}),
+            width := lists.length (literals.binaryToBytes (text.encodeUtf8 (strings.fromList [c])))
+        in eithers.foldList
+          (λacc1:(Recording, (int32, list<AtomId>)), j:int32.
+            let k := pairs.first (pairs.second acc1)
+            in eithers.map (λr2:Recording. (r2, (math.add k 1:int32, lists.cons (atomId (messageKey k)) (pairs.second (pairs.second acc1)))))
+              (addDerived (pairs.first acc1) (messageKey k) (intermediate (strings.concat2 "byte " (literals.printInt32 k)))
+                (inject(hydraos.riscv.derivation.Formula){utf8 = Utf8Byte{atom = atomId (charKey i), index = j}})
+                (Rule{definition = "hydra.core.lib.text.encodeUtf8", detail = strings.concat ["byte ", literals.printInt32 j, " of character ", literals.printInt32 i]})))
+          (r1, pairs.second acc)
+          (lists.map (λju:(int32, unit). pairs.first ju) (numbered (lists.replicate width unit)))
+  in do either {
+    traced := eithers.foldList character (r, (0:int32, [])) (numbered (strings.toList (pairs.second written))),
+    ids := eithers.right (lists.reverse (pairs.second (pairs.second traced))),
+    checked := checkMessage definition (pairs.first traced) ids evaluated,
+    eithers.right (pairs.first traced, ids)}
+
+## The message as Hydra evaluated it: a stated atom per byte, placed on the argument of writeStdout in main.
+term wholeMessage = λmain:string, evaluated:list<int32>, r:Recording.
+  (lists.foldl
+    (λr1:Recording, kb:(int32, int32). addStated r1 (messageKey (pairs.first kb)) (inSource (placeAt main [stepArgument]))
+      (number (literals.int32ToBigint (pairs.second kb)))
+      (Rule{definition = "hydraos.riscv.coder.reducedBinary", detail = strings.concat ["byte ", literals.printInt32 (pairs.first kb), ", as Hydra's evaluator reduced the message"]}))
+    r (numbered evaluated),
+   lists.map (λkb:(int32, int32). atomId (messageKey (pairs.first kb))) (numbered evaluated))
+
+## Trace main's message, given the bytes Hydra evaluated it to. When main writes encodeUtf8 applied to a
+## string literal, directly or through definitions of m: an atom <definition>/char/<i> per character and
+## an atom message/<k> per byte, each byte checked against the bytes Hydra evaluated. Otherwise an atom
+## message/<k> per byte as Hydra evaluated it. Also the ids of the message's atoms, in order.
+term traceMessage = λm:Module, bytes:binary, r:Recording.
+  let main := mainName m,
+      evaluated := literals.binaryToBytes bytes,
+      argument := optionals.bind (mainBody m) (λbody:Term.
+        cases(hydra.core.model.Term){application = λa:Application. given(Application[argument] a), `_` = none}
+        (deannotateAndDetypeTerm body))
+  in optionals.match (optionals.bind argument (λt:Term. messageString m main [stepArgument] t))
+    (eithers.right (wholeMessage main evaluated r))
+    (λwritten:(SourcePlace, string). perCharacter written evaluated r)
+
+## The atom of the register a variable names, recorded once: its number, stated in the register's
+## definition among the sources, Register{n}. Also the atom's id.
+term registerAtom = λsources:list<Module>, r:Recording, name:string.
+  let place := placeAt name [stepWrap],
+      key := sourceKey place,
+      notRegister := eithers.left (strings.concat ["hydraos.riscv.coder: ", name, " is not a register, Register{n} with an int32 literal n"])
+  in optionals.match (definitionIn sources name)
+    (eithers.left (strings.concat ["hydraos.riscv.coder: no definition ", name, " among the sources"]))
+    (λbody:Term. cases(hydra.core.model.Term){
+        `wrap` = λw:WrappedTerm. logic.ifElse (equality.equal (Name[] (WrappedTerm[typeName] w)) "hydraos.riscv.model.Register")
+          (cases(hydra.core.model.Term){
+              literal = λl:Literal. cases(hydra.core.model.Literal){
+                  integer = λi:IntegerValue. cases(hydra.core.model.IntegerValue){
+                      `int32` = λn:int32. eithers.right (logic.ifElse (maps.member key (Recording[values] r)) r
+                          (addStated r key (inSource place) (number (literals.int32ToBigint n)) (Rule{definition = name, detail = "the number of the register"})),
+                        key),
+                      `_` = notRegister}
+                    i,
+                  `_` = notRegister}
+                l,
+              `_` = notRegister}
+            (deannotateAndDetypeTerm (WrappedTerm[body] w)))
+          notRegister,
+        `_` = notRegister}
+      (deannotateAndDetypeTerm body))
+
+## Whether a term is lists.length (literals.binaryToBytes x), with x the variable called parameter.
+term isLengthOf = λparameter:string, t:Term.
+  cases(hydra.core.model.Term){
+    application = λa:Application. logic.and (isVariable "hydra.core.lib.lists.length" (Application[function] a))
+      (cases(hydra.core.model.Term){
+          application = λb:Application. logic.and (isVariable "hydra.core.lib.literals.binaryToBytes" (Application[function] b)) (isVariable parameter (Application[argument] b)),
+          `_` = false}
+        (deannotateAndDetypeTerm (Application[argument] a))),
+    `_` = false}
+  (deannotateAndDetypeTerm t)
+
+## Trace one argument of a call: the atom of the operand it gives, and what it traces to, by role. An int32
+## literal or a label name is stated where it is written, and a register is a copy of its number. In
+## mainProgram, its parameter, the message, gives the message's bytes as data, and the length of its bytes
+## counts them. The name a label defines gets no atom: labels are the program's structure.
+term traceArgument = λsources:list<Module>, message:list<AtomId>, parameter:string, call:Call,
+    acc:(Recording, (list<OperandAtom>, list<(string, Value)>)), arg:Argument.
+  let r := pairs.first acc,
+      operands := pairs.first (pairs.second acc),
+      seen := pairs.second (pairs.second acc),
+      field := Argument[field] arg,
+      definition := SourcePlace[definition] (Call[place] call),
+      place := SourcePlace{definition = definition, path = Argument[path] arg, character = none},
+      key := sourceKey place,
+      what := strings.concat [field, " of ", Call[builds] call],
+      rule := Rule{definition = definition, detail = what},
+      s := deannotateAndDetypeTerm (Argument[written] arg),
+      inMain := equality.equal definition mainProgramName,
+      cannot := eithers.left (strings.concat ["hydraos.riscv.coder: cannot trace the ", what, " at ", placeText place, ": ", describe s]),
+      withOperand := λr1:Recording. eithers.map
+        (λv:Value. (r1, (lists.concat2 operands [OperandAtom{role = field, atom = atomId key}], lists.concat2 seen [(field, v)])))
+        (valueAt (Recording[values] r1) (atomId key)),
+      statedOperand := λv:Value. withOperand (addStated r key (inSource place) v rule)
+  in cases(hydra.core.model.Term){
+    literal = λl:Literal. cases(hydra.core.model.Literal){
+        integer = λi:IntegerValue. cases(hydra.core.model.IntegerValue){
+            `int32` = λn:int32. statedOperand (number (literals.int32ToBigint n)),
+            `_` = cannot}
+          i,
+        `string` = λx:string. logic.ifElse (equality.equal field "label")
+          (eithers.right (r, (operands, lists.concat2 seen [(field, inject(hydraos.riscv.derivation.Value){name = x})])))
+          (statedOperand (inject(hydraos.riscv.derivation.Value){name = x})),
+        `_` = cannot}
+      l,
+    variable = λn:Name. logic.ifElse (logic.and inMain (equality.equal (Name[] n) parameter))
+      (logic.ifElse (equality.equal field "data")
+        (eithers.map
+          (λvs:list<Value>. (r, (lists.concat2 operands (lists.map (λa:AtomId. OperandAtom{role = "byte", atom = a}) message),
+            lists.concat2 seen (lists.map (λv:Value. ("byte", v)) vs))))
+          (eithers.mapList (λa:AtomId. valueAt (Recording[values] r) a) message))
+        cannot)
+      (eithers.bind (registerAtom sources r (Name[] n)) (λrk:(Recording, string).
+        eithers.bind (addDerived (pairs.first rk) key (inSource place) (copyOf (pairs.second rk)) rule) withOperand)),
+    application = λa:Application. logic.ifElse (logic.and inMain (isLengthOf parameter s))
+      (eithers.bind
+        (addDerived r key (inSource place) (inject(hydraos.riscv.derivation.Formula){count = message})
+          (Rule{definition = "hydra.core.lib.lists.length", detail = strings.concat2 what ", the number of bytes of the message"}))
+        withOperand)
+      cannot,
+    `_` = cannot}
+  s
+
+## Trace a call: the atoms of its operands, the item's trace, and what the call traces to, by role.
+term traceCall = λsources:list<Module>, message:list<AtomId>, parameter:string, r:Recording, call:Call.
+  eithers.map
+    (λacc:(Recording, (list<OperandAtom>, list<(string, Value)>)).
+      (pairs.first acc, (ItemTrace{place = given(Call[place] call), operands = pairs.first (pairs.second acc)}, pairs.second (pairs.second acc))))
+    (eithers.foldList (traceArgument sources message parameter call) (r, ([], [])) (Call[arguments] call))
+
+## The variant of an item: an instruction's mnemonic, label or data.
+term itemVariant = λitem:Item.
+  cases(hydraos.riscv.model.Item){
+    label = λl:Label. "label",
+    data = λb:binary. "data",
+    instruction = λi:Instruction. cases(hydraos.riscv.model.Instruction){
+        addi = λx:IType. "addi",
+        andi = λx:IType. "andi",
+        beq = λx:Branch. "beq",
+        jal = λx:Jump. "jal",
+        jalr = λx:IType. "jalr",
+        la = λx:LoadAddress. "la",
+        lbu = λx:IType. "lbu",
+        lui = λx:UType. "lui",
+        sb = λx:SType. "sb",
+        sw = λx:SType. "sw",
+        wfi = λ`_`. "wfi"}
+      i}
+  item
+
+## What item k of the program Hydra evaluated holds, by role: the name a label defines, or its operands.
+term evaluatedOperands = λk:int32, item:Item.
+  cases(hydraos.riscv.model.Item){
+    label = λl:Label. [("label", inject(hydraos.riscv.derivation.Value){name = Label[] l})],
+    `_` = let u := untracedItem (k, item)
+      in lists.map (λoa:(OperandAtom, Atom). (OperandAtom[role] (pairs.first oa), Atom[value] (pairs.second oa)))
+        (lists.zip (ItemTrace[operands] (pairs.first u)) (pairs.second u))}
+  item
+
+## Operands by role, for a message: rd 5, imm 256, target "main".
+term describeOperands = λxs:list<(string, Value)>.
+  strings.join ", " (lists.map
+    (λrv:(string, Value). strings.concat [pairs.first rv, " ", cases(hydraos.riscv.derivation.Value){
+        number = λn:bigint. literals.printBigint n,
+        name = λx:string. strings.concat ["\"", x, "\""]}
+      (pairs.second rv)])
+    xs)
+
+## Operands sorted by role. The sort is stable, so a data item's bytes stay in order.
+term byRole = λxs:list<(string, Value)>. lists.sortBy (λrv:(string, Value). pairs.first rv) xs
+
+## A traced item must be the item Hydra evaluated: the same variant, with the same operands or label name,
+## whatever order the call writes its arguments in.
+term checkItem = λk:int32, call:Call, traced:list<(string, Value)>, item:Item.
+  let which := strings.concat ["hydraos.riscv.coder: item ", literals.printInt32 k, " (", Call[builds] call, " at ", placeText (Call[place] call), ")"],
+      evaluated := evaluatedOperands k item
+  in logic.ifElse (equality.equal (Call[builds] call) (itemVariant item))
+    (logic.ifElse (equality.equal (byRole traced) (byRole evaluated))
+      (eithers.right unit)
+      (eithers.left (strings.concat [which, " traces to ", describeOperands traced, ", but Hydra evaluated ", describeOperands evaluated])))
+    (eithers.left (strings.concat [which, " is a ", itemVariant item, " in the program Hydra evaluated"]))
+
+## Trace each call as the item at its index in the program Hydra evaluated, and check it against that item.
+term traceCalls = λsources:list<Module>, message:list<AtomId>, parameter:string, p:Program, r:Recording, calls:list<Call>.
+  let items := Program[] p
+  in logic.ifElse (equality.equal (lists.length calls) (lists.length items))
+    (eithers.map (λacc:(Recording, list<ItemTrace>). (pairs.first acc, lists.reverse (pairs.second acc)))
+      (eithers.foldList
+        (λacc:(Recording, list<ItemTrace>), kci:(int32, (Call, Item)).
+          let k := pairs.first kci,
+              call := pairs.first (pairs.second kci),
+              item := pairs.second (pairs.second kci)
+          in eithers.bind (traceCall sources message parameter (pairs.first acc) call)
+            (λt:(Recording, (ItemTrace, list<(string, Value)>)).
+              eithers.map (λu:unit. (pairs.first t, lists.cons (pairs.first (pairs.second t)) (pairs.second acc)))
+                (checkItem k call (pairs.second (pairs.second t)) item)))
+        (r, [])
+        (numbered (lists.zip calls items))))
+    (eithers.left (strings.concat ["hydraos.riscv.coder: the sources give ", literals.printInt32 (lists.length calls), " items, but Hydra evaluated ", literals.printInt32 (lists.length items)]))
+
+## The calls of this module's mainProgram, read from its source among the sources, and the name of its
+## parameter, the message: λbytes. wrap(Program){an item list}.
+term programCalls = λsources:list<Module>.
+  let notProgram := eithers.left (strings.concat ["hydraos.riscv.coder: ", mainProgramName, " is not a lambda over a wrapped item list"])
+  in optionals.match (definitionIn sources mainProgramName)
+    (eithers.left (strings.concat ["hydraos.riscv.coder: no definition ", mainProgramName, " among the sources"]))
+    (λbody:Term. cases(hydra.core.model.Term){
+        lambda = λl:Lambda. cases(hydra.core.model.Term){
+            `wrap` = λw:WrappedTerm. eithers.map (λcalls:list<Call>. (Name[] (Lambda[parameter] l), calls))
+              (callsIn sources mainProgramName [stepLambda, stepWrap] (WrappedTerm[body] w)),
+            `_` = notProgram}
+          (deannotateAndDetypeTerm (Lambda[body] l)),
+        `_` = notProgram}
+      (deannotateAndDetypeTerm body))
+
+## A module's program and where its items came from: the message read from m's own definitions, the items
+## from this module's mainProgram, the runtime and the DSL among sources, and every traced value checked
+## against the program Hydra evaluated. With no sources, every operand is stated by the program.
+term traceProgram = λg:Graph, m:Module, sources:list<Module>.
+  eithers.bind (compiledBytes g m) (λbytes:binary.
+    let p := mainProgram bytes
+    in logic.ifElse (lists.isEmpty sources)
+      (eithers.right (untraced p))
+      (do either {
+        message := traceMessage m bytes (recordingOf []),
+        calls := programCalls sources,
+        traced := traceCalls sources (pairs.second message) (pairs.first calls) p (pairs.first message) (pairs.second calls),
+        eithers.right (TracedProgram{program = p, items = pairs.second traced, atoms = recorded (pairs.first traced)})}))
+
+## Compile, trace and encode: the boot image for a module's main, with its derivation.
+term buildTraced = λg:Graph, m:Module, sources:list<Module>. eithers.bind (traceProgram g m sources) encodeTraced
 
 ## Compile and encode: the boot image for a module's main.
-term buildImage = λg:Graph, m:Module. eithers.bind (compileModule g m) encodeProgram
+term buildImage = λg:Graph, m:Module. eithers.map (λt:Traced. Traced[image] t) (buildTraced g m [])
