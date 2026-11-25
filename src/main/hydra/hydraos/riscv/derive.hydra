@@ -279,3 +279,33 @@ term coverage = λd:Derivation.
     bits = lists.foldl (λn:int32, w:(int32, boolean). math.add n (pairs.first w)) 0:int32 widths,
     sourceBits = lists.foldl (λn:int32, w:(int32, boolean). logic.ifElse (pairs.second w) (math.add n (pairs.first w)) n) 0:int32 widths,
     atoms = lists.length atoms}
+
+## A recording that starts from atoms already recorded, oldest first.
+term recordingOf = λatoms:list<Atom>. Recording{values = atomValues atoms, atoms = lists.reverse atoms}
+
+## The atoms recorded, oldest first.
+term recorded = λr:Recording. lists.reverse (Recording[atoms] r)
+
+## Record a derived atom: its value is what its formula gives from the atoms recorded so far.
+term addDerived = λr:Recording, key:string, place:Place, f:Formula, why:Rule.
+  eithers.map (λa:Atom. Recording{values = maps.insert key (Atom[value] a) (Recording[values] r), atoms = lists.cons a (Recording[atoms] r)})
+    (derived (Recording[values] r) key place f why)
+
+## Record a stated atom.
+term addStated = λr:Recording, key:string, place:Place, v:Value, why:Rule.
+  Recording{values = maps.insert key v (Recording[values] r), atoms = lists.cons (stated key place v why) (Recording[atoms] r)}
+
+## The number an atom recorded so far holds.
+term numberIn = λr:Recording, key:string. numberAt (Recording[values] r) (wrap(hydraos.riscv.derivation.AtomId){key})
+
+## The name an atom recorded so far holds.
+term nameIn = λr:Recording, key:string.
+  eithers.bind (valueAt (Recording[values] r) (wrap(hydraos.riscv.derivation.AtomId){key})) (λv:Value.
+    cases(hydraos.riscv.derivation.Value){
+      name = λs:string. eithers.right s,
+      number = λn:bigint. eithers.left (strings.concat ["derivation: ", key, " holds the number ", literals.printBigint n, ", not a name"])}
+    v)
+
+## Each element of a list with its index, from 0.
+term numbered = λxs.
+  lists.reverse (pairs.second (lists.foldl (λacc, x. (math.add (pairs.first acc) 1:int32, lists.cons (pairs.first acc, x) (pairs.second acc))) (0:int32, []) xs))

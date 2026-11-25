@@ -53,3 +53,14 @@ type Item = union{
 
 ## A flat image: the items in order, starting at offset 0.
 type Program = wrap(list<Item>)
+
+## The fixed fields of one instruction this project emits: its opcode, and each other field whose value
+## does not come from an operand (funct3; for wfi also funct12, rs1 and rd).
+type Encoding = record{mnemonic: string, opcode: int32, fixed: list<FixedField>}
+
+## One fixed field of an encoding, named as in the RISC-V manual's instruction formats.
+type FixedField = record{field: string, value: int32}
+
+## Everything the encoder uses besides the program: the encodings, the size of an instruction, of la
+## and of a label, and the two constants with which la splits an offset into pages.
+type Constants = record{encodings: list<Encoding>, instructionSize: int32, loadAddressSize: int32, labelSize: int32, pageSize: bigint, pageHalf: bigint}

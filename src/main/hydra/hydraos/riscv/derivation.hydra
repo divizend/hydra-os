@@ -79,3 +79,9 @@ type Coverage = record{bits: int32, sourceBits: int32, atoms: int32}
 
 ## A boot image with its derivation.
 type Traced = record{image: binary, derivation: Derivation, coverage: Coverage}
+
+## One field of an instruction word: its name, its lowest bit, its width, and the formula of its value.
+type Slot = record{field: string, lo: int32, width: int32, formula: Formula}
+
+## The atoms recorded so far, newest first, and their values by id.
+type Recording = record{values: map<string, Value>, atoms: list<Atom>}

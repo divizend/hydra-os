@@ -1,12 +1,17 @@
-## Encode a hydraos.riscv.model.Program as a flat RV64I image, little-endian.
+## Encode a hydraos.riscv.model.Program as a flat RV64I image, little-endian, and record how: each
+## constant, size, offset and field of the image becomes an atom of its derivation
+## (hydraos.riscv.derivation), and the image is assembled from those atoms (hydraos.riscv.derive), so the
+## image and its record are one computation.
 ##
-## Pass 1 lays the items out: the offset of every label, checking that labels are unique and that
-## every instruction starts on a 4-byte boundary. Pass 2 encodes each item at its offset. Every
-## immediate and offset is range-checked; nothing is ever truncated. Instruction words are built
-## with bigint arithmetic, because Hydra has no bitwise primitives and a 32-bit word does not fit
-## in int32. Hydra has no primitive from bytes to binary, so the image goes through base64.
+## Pass 1 lays the items out: the size and offset of every item and the offset of every label, checking
+## that labels are unique and that every instruction starts on a 4-byte boundary. Pass 2 derives every
+## field of every instruction from its operands and the constants below. Every immediate, offset and
+## constant is range-checked; nothing is ever truncated.
 module hydraos.riscv.encode
 
+import hydra.core.model
+import hydra.core.paths
+import hydraos.riscv.derivation
 import hydraos.riscv.derive
 import hydraos.riscv.model
 import hydra.core.lib.eithers as eithers
@@ -21,174 +26,415 @@ import hydra.core.lib.ordering as ordering
 import hydra.core.lib.pairs as pairs
 import hydra.core.lib.strings as strings
 
-## v as a bigint if it lies in [lo, hi]; otherwise "<mnemonic>: <what> <v> out of range [<lo>, <hi>]".
-term checkRange = λmnemonic:string, what:string, v:int32, lo:int32, hi:int32.
+## The fixed fields of each instruction this encoder emits, from The RISC-V Instruction Set Manual,
+## Volume I, version 20191213, chapter 24, and for wfi Volume II, version 20211203, section 3.3.3 (a
+## SYSTEM instruction with funct12 0x105). la is two instructions, auipc and addi.
+term encodings = [
+  Encoding{mnemonic = "addi", opcode = 19:int32, fixed = [FixedField{field = "funct3", value = 0:int32}]},
+  Encoding{mnemonic = "andi", opcode = 19:int32, fixed = [FixedField{field = "funct3", value = 7:int32}]},
+  Encoding{mnemonic = "beq", opcode = 99:int32, fixed = [FixedField{field = "funct3", value = 0:int32}]},
+  Encoding{mnemonic = "jal", opcode = 111:int32, fixed = []},
+  Encoding{mnemonic = "jalr", opcode = 103:int32, fixed = [FixedField{field = "funct3", value = 0:int32}]},
+  Encoding{mnemonic = "la.auipc", opcode = 23:int32, fixed = []},
+  Encoding{mnemonic = "la.addi", opcode = 19:int32, fixed = [FixedField{field = "funct3", value = 0:int32}]},
+  Encoding{mnemonic = "lbu", opcode = 3:int32, fixed = [FixedField{field = "funct3", value = 4:int32}]},
+  Encoding{mnemonic = "lui", opcode = 55:int32, fixed = []},
+  Encoding{mnemonic = "sb", opcode = 35:int32, fixed = [FixedField{field = "funct3", value = 0:int32}]},
+  Encoding{mnemonic = "sw", opcode = 35:int32, fixed = [FixedField{field = "funct3", value = 2:int32}]},
+  Encoding{mnemonic = "wfi", opcode = 115:int32, fixed = [
+    FixedField{field = "funct12", value = 261:int32},
+    FixedField{field = "rs1", value = 0:int32},
+    FixedField{field = "funct3", value = 0:int32},
+    FixedField{field = "rd", value = 0:int32}]}]
+
+## The size of an instruction, in bytes.
+term instructionSize = 4:int32
+
+## The size of la, which is two instructions.
+term loadAddressSize = 8:int32
+
+## The size of a label: none.
+term labelSize = 0:int32
+
+## la adds whole pages of pageSize bytes with auipc and the rest with addi.
+term pageSize = 4096:bigint
+
+## Half a page, which rounds la's offset so that the rest fits a signed 12-bit immediate.
+term pageHalf = 2048:bigint
+
+## Everything the encoder uses besides the program.
+term constants = Constants{encodings = encodings, instructionSize = instructionSize, loadAddressSize = loadAddressSize, labelSize = labelSize, pageSize = pageSize, pageHalf = pageHalf}
+
+## A rule of this module: the definition that applied a formula, and what it did.
+term ruleOf = λdefinition:string, detail:string. Rule{definition = strings.concat2 "hydraos.riscv.encode." definition, detail = detail}
+
+## A place in this module's own source: the subterm at steps inside definition.
+term encoderPlace = λdefinition:string, steps:list<SubtermStep>.
+  inject(hydraos.riscv.derivation.Place){source = SourcePlace{definition = strings.concat2 "hydraos.riscv.encode." definition, path = wrap(hydra.core.paths.SubtermPath){steps}, character = none}}
+
+## A named intermediate value of the build.
+term intermediate = λname:string. inject(hydraos.riscv.derivation.Place){intermediate = name}
+
+## Bits of the image: width bits from bit lo of the unit at byte offset.
+term imagePlace = λoffset:int32, lo:int32, width:int32. inject(hydraos.riscv.derivation.Place){image = ImagePlace{offset = offset, lo = lo, width = width}}
+
+## The id of an atom.
+term atomId = λkey:string. wrap(hydraos.riscv.derivation.AtomId){key}
+
+## A copy of another atom.
+term copyOf = λkey:string. inject(hydraos.riscv.derivation.Formula){copy = atomId key}
+
+## Bits lo to lo + width - 1 of another atom.
+term bitsOf = λkey:string, lo:int32, width:int32. inject(hydraos.riscv.derivation.Formula){bits = BitsOf{atom = atomId key, lo = lo, width = width}}
+
+## Keys of the atoms this module records.
+term opcodeKey = λmnemonic:string. strings.concat ["encode/", mnemonic, "/opcode"]
+term fixedKey = λmnemonic:string, field:string. strings.concat ["encode/", mnemonic, "/", field]
+term operandKey = λk:int32, role:string. strings.concat ["item/", literals.printInt32 k, "/", role]
+term sizeKey = λk:int32. strings.concat2 "size/" (literals.printInt32 k)
+term pcKey = λk:int32. strings.concat2 "pc/" (literals.printInt32 k)
+term wordKey = λpc:int32, part:string. strings.concat ["word/", literals.printInt32 pc, "/", part]
+term imageKey = λoffset:int32, field:string. strings.concat ["image/", literals.printInt32 offset, "/", field]
+
+## The range a fixed field's value must lie in, by the field's name.
+term fixedRange = λfield:string.
+  logic.ifElse (equality.equal field "funct3") (given((0:bigint, 7:bigint)))
+    (logic.ifElse (equality.equal field "funct12") (given((0:bigint, 4095:bigint)))
+      (logic.ifElse (logic.or (equality.equal field "rs1") (equality.equal field "rd")) (given((0:bigint, 31:bigint))) none))
+
+## v if it lies in [lo, hi]; otherwise "<mnemonic>: <what> <v> out of range [<lo>, <hi>]".
+term inRange = λmnemonic:string, what:string, v:bigint, lo:bigint, hi:bigint.
   logic.ifElse (logic.or (ordering.lt v lo) (ordering.gt v hi))
-    (eithers.left (strings.concat [mnemonic, ": ", what, " ", literals.printInt32 v, " out of range [", literals.printInt32 lo, ", ", literals.printInt32 hi, "]"]))
-    (eithers.right (literals.int32ToBigint v))
+    (eithers.left (strings.concat [mnemonic, ": ", what, " ", literals.printBigint v, " out of range [", literals.printBigint lo, ", ", literals.printBigint hi, "]"]))
+    (eithers.right v)
 
-## A register's number as a bigint, checked to lie in [0, 31].
-term registerNumber = λr:Register.
-  let n := Register[] r
-  in logic.ifElse (logic.or (ordering.lt n 0:int32) (ordering.gt n 31:int32))
-    (eithers.left (strings.concat ["register ", literals.printInt32 n, " out of range [0, 31]"]))
-    (eithers.right (literals.int32ToBigint n))
+## Record one encoding's opcode and fixed fields as stated atoms placed in the encodings table, each
+## checked against the range of the field it fills.
+term recordEncoding = λr:Recording, ke:(int32, Encoding).
+  let k := pairs.first ke,
+      e := pairs.second ke,
+      mnemonic := Encoding[mnemonic] e,
+      element := inject(hydra.core.paths.SubtermStep){listElement = k}
+  in do either {
+    opcode := inRange mnemonic "opcode" (literals.int32ToBigint (Encoding[opcode] e)) 0:bigint 127:bigint,
+    eithers.foldList
+      (λr1:Recording, jf:(int32, FixedField).
+        let f := pairs.second jf,
+            field := FixedField[field] f,
+            v := literals.int32ToBigint (FixedField[value] f)
+        in optionals.match (fixedRange field)
+          (eithers.left (strings.concat [mnemonic, ": no fixed field is called ", field]))
+          (λbounds:(bigint, bigint). eithers.map
+            (λchecked:bigint. addStated r1 (fixedKey mnemonic field)
+              (encoderPlace "encodings" [element, inject(hydra.core.paths.SubtermStep){recordField = Name{"fixed"}}, inject(hydra.core.paths.SubtermStep){listElement = pairs.first jf}, inject(hydra.core.paths.SubtermStep){recordField = Name{"value"}}])
+              (number v) (ruleOf "encodings" (strings.concat [field, " of ", mnemonic])))
+            (inRange mnemonic field v (pairs.first bounds) (pairs.second bounds))))
+      (addStated r (opcodeKey mnemonic) (encoderPlace "encodings" [element, inject(hydra.core.paths.SubtermStep){recordField = Name{"opcode"}}])
+        (number opcode) (ruleOf "encodings" (strings.concat2 "opcode of " mnemonic)))
+      (numbered (Encoding[fixed] e))}
 
-## The offset from pc to a label, checked to exist and, when aligned is true, to be 4-byte aligned:
-## branch and jump targets must be instructions, but la may address any byte.
-term targetOffset = λmnemonic:string, aligned:boolean, labels:map<string, int32>, pc:int32, target:Label.
-  let name := Label[] target
-  in optionals.match (maps.lookup name labels)
-    (eithers.left (strings.concat [mnemonic, ": undefined label ", name]))
-    (λaddress:int32. logic.ifElse (logic.or (logic.not aligned) (equality.equal (modulo32 address 4:int32) 0:int32))
-      (eithers.right (math.sub address pc))
-      (eithers.left (strings.concat [mnemonic, ": target ", name, " at offset ", literals.printInt32 address, " is not 4-byte aligned"])))
+## Record the encoder's constants as stated atoms in its own source.
+term recordConstants = λc:Constants, r:Recording.
+  eithers.map
+    (λr1:Recording.
+      addStated (addStated (addStated (addStated (addStated r1
+        "encode/instructionSize" (encoderPlace "instructionSize" []) (number (literals.int32ToBigint (Constants[instructionSize] c))) (ruleOf "instructionSize" "the size of an instruction"))
+        "encode/loadAddressSize" (encoderPlace "loadAddressSize" []) (number (literals.int32ToBigint (Constants[loadAddressSize] c))) (ruleOf "loadAddressSize" "the size of la"))
+        "encode/labelSize" (encoderPlace "labelSize" []) (number (literals.int32ToBigint (Constants[labelSize] c))) (ruleOf "labelSize" "the size of a label"))
+        "encode/pageSize" (encoderPlace "pageSize" []) (number (Constants[pageSize] c)) (ruleOf "pageSize" "a page"))
+        "encode/pageHalf" (encoderPlace "pageHalf" []) (number (Constants[pageHalf] c)) (ruleOf "pageHalf" "half a page"))
+    (eithers.foldList recordEncoding r (numbered (Constants[encodings] c)))
 
-## An I-type word: imm[11:0] rs1 funct3 rd opcode.
-term iFields = λimm:bigint, rs1:bigint, funct3:int32, rd:bigint, opcode:int32.
-  wordBytes (sumOf [
-    shifted (modulo imm 4096:bigint) 20:int32,
-    shifted rs1 15:int32,
-    shifted (literals.int32ToBigint funct3) 12:int32,
-    shifted rd 7:int32,
-    literals.int32ToBigint opcode])
+## The atom holding the operand of item k with the given role.
+term operandOf = λk:int32, trace:ItemTrace, role:string.
+  optionals.match (lists.find (λo:OperandAtom. equality.equal (OperandAtom[role] o) role) (ItemTrace[operands] trace))
+    (eithers.left (strings.concat ["item ", literals.printInt32 k, " has no operand ", role]))
+    (λo:OperandAtom. eithers.right (AtomId[] (OperandAtom[atom] o)))
 
-## An S-type word: imm[11:5] rs2 rs1 funct3 imm[4:0] opcode.
-term sFields = λimm:bigint, rs2:bigint, rs1:bigint, funct3:int32, opcode:int32.
-  let imm12 := modulo imm 4096:bigint
-  in wordBytes (sumOf [
-    shifted (quotient imm12 32:bigint) 25:int32,
-    shifted rs2 20:int32,
-    shifted rs1 15:int32,
-    shifted (literals.int32ToBigint funct3) 12:int32,
-    shifted (modulo imm12 32:bigint) 7:int32,
-    literals.int32ToBigint opcode])
+## The atoms of a data item's bytes, in order.
+term dataBytes = λtrace:ItemTrace.
+  lists.map (λo:OperandAtom. AtomId[] (OperandAtom[atom] o)) (lists.filter (λo:OperandAtom. equality.equal (OperandAtom[role] o) "byte") (ItemTrace[operands] trace))
 
-## A B-type word: imm[12|10:5] rs2 rs1 funct3 imm[4:1|11] opcode.
-term bFields = λoffset:bigint, rs2:bigint, rs1:bigint, funct3:int32, opcode:int32.
-  let o := modulo offset 8192:bigint
-  in wordBytes (sumOf [
-    shifted (bitField o 12:int32 1:int32) 31:int32,
-    shifted (bitField o 5:int32 6:int32) 25:int32,
-    shifted rs2 20:int32,
-    shifted rs1 15:int32,
-    shifted (literals.int32ToBigint funct3) 12:int32,
-    shifted (bitField o 1:int32 4:int32) 8:int32,
-    shifted (bitField o 11:int32 1:int32) 7:int32,
-    literals.int32ToBigint opcode])
+## Pass 1 for item k: record its size and its offset, check that an instruction is 4-byte aligned, and
+## record the offset of a label, which must be new.
+term layoutItem = λr:Recording, kit:(int32, (Item, ItemTrace)).
+  let k := pairs.first kit,
+      item := pairs.first (pairs.second kit),
+      trace := pairs.second (pairs.second kit),
+      size := cases(hydraos.riscv.model.Item){
+        label = λl:Label. (copyOf "encode/labelSize", "a label takes no space"),
+        instruction = λi:Instruction. cases(hydraos.riscv.model.Instruction){
+            la = λl:LoadAddress. (copyOf "encode/loadAddressSize", "la is two instructions"),
+            `_` = (copyOf "encode/instructionSize", "one instruction")}
+          i,
+        data = λb:binary. (inject(hydraos.riscv.derivation.Formula){count = lists.map atomId (dataBytes trace)}, "data takes one byte per byte")}
+        item,
+      offset := logic.ifElse (equality.equal k 0:int32)
+        (inject(hydraos.riscv.derivation.Formula){sum = []})
+        (inject(hydraos.riscv.derivation.Formula){sum = [atomId (pcKey (math.sub k 1:int32)), atomId (sizeKey (math.sub k 1:int32))]})
+  in do either {
+    r1 := addDerived r (sizeKey k) (intermediate (strings.concat2 "the size of item " (literals.printInt32 k))) (pairs.first size) (ruleOf "layoutItem" (pairs.second size)),
+    r2 := addDerived r1 (pcKey k) (intermediate (strings.concat2 "the offset of item " (literals.printInt32 k))) offset (ruleOf "layoutItem" "the sum of the sizes before it"),
+    pc := numberIn r2 (pcKey k),
+    cases(hydraos.riscv.model.Item){
+      label = λl:Label.
+        let name := Label[] l
+        in logic.ifElse (maps.member (strings.concat2 "label/" name) (Recording[values] r2))
+          (eithers.left (strings.concat2 "duplicate label " name))
+          (addDerived r2 (strings.concat2 "label/" name) (intermediate (strings.concat2 "label " name)) (copyOf (pcKey k)) (ruleOf "layoutItem" (strings.concat2 "the offset of label " name))),
+      instruction = λi:Instruction. logic.ifElse (equality.equal (modulo pc 4:bigint) 0:bigint)
+        (eithers.right r2)
+        (eithers.left (strings.concat ["instruction at offset ", literals.printBigint pc, " is not 4-byte aligned"])),
+      data = λb:binary. eithers.right r2}
+      item}
 
-## A U-type word: imm[31:12] rd opcode.
-term uFields = λimm20:bigint, rd:bigint, opcode:int32.
-  wordBytes (sumOf [
-    shifted (modulo imm20 1048576:bigint) 12:int32,
-    shifted rd 7:int32,
-    literals.int32ToBigint opcode])
+## A register operand, checked to lie in [0, 31].
+term checkedRegister = λr:Recording, key:string.
+  eithers.bind (numberIn r key) (λv:bigint.
+    logic.ifElse (logic.or (ordering.lt v 0:bigint) (ordering.gt v 31:bigint))
+      (eithers.left (strings.concat ["register ", literals.printBigint v, " out of range [0, 31]"]))
+      (eithers.right v))
 
-## A J-type word: imm[20|10:1|11|19:12] rd opcode.
-term jFields = λoffset:bigint, rd:bigint, opcode:int32.
-  let o := modulo offset 2097152:bigint
-  in wordBytes (sumOf [
-    shifted (bitField o 20:int32 1:int32) 31:int32,
-    shifted (bitField o 1:int32 10:int32) 21:int32,
-    shifted (bitField o 11:int32 1:int32) 20:int32,
-    shifted (bitField o 12:int32 8:int32) 12:int32,
-    shifted rd 7:int32,
-    literals.int32ToBigint opcode])
+## A number operand, checked to lie in [lo, hi].
+term checkedNumber = λr:Recording, key:string, mnemonic:string, what:string, lo:bigint, hi:bigint.
+  eithers.bind (numberIn r key) (λv:bigint. inRange mnemonic what v lo hi)
+
+## Record the offset from the item at pc to the label its target operand names: the label must be
+## defined and, when aligned is true, 4-byte aligned, since branches and jumps land on instructions.
+term recordOffset = λr:Recording, mnemonic:string, aligned:boolean, k:int32, pc:int32, target:string.
+  do either {
+    name := nameIn r target,
+    defined := logic.ifElse (maps.member (strings.concat2 "label/" name) (Recording[values] r))
+      (eithers.right unit)
+      (eithers.left (strings.concat [mnemonic, ": undefined label ", name])),
+    r1 := addDerived r (wordKey pc "target") (intermediate (strings.concat2 "the offset of " name))
+      (inject(hydraos.riscv.derivation.Formula){labelOffset = atomId target}) (ruleOf "recordOffset" (strings.concat [mnemonic, " targets ", name])),
+    address := numberIn r1 (wordKey pc "target"),
+    landed := logic.ifElse (logic.or (logic.not aligned) (equality.equal (modulo address 4:bigint) 0:bigint))
+      (eithers.right unit)
+      (eithers.left (strings.concat [mnemonic, ": target ", name, " at offset ", literals.printBigint address, " is not 4-byte aligned"])),
+    addDerived r1 (wordKey pc "offset") (intermediate (strings.concat2 "the offset to " name))
+      (inject(hydraos.riscv.derivation.Formula){difference = Operands{x = atomId (wordKey pc "target"), y = atomId (pcKey k)}})
+      (ruleOf "recordOffset" "the target's offset minus the instruction's")}
+
+## A field of an instruction word.
+term slot = λfield:string, lo:int32, width:int32, f:Formula. Slot{field = field, lo = lo, width = width, formula = f}
+
+## The fields of an I-type word: imm[11:0] rs1 funct3 rd opcode.
+term iSlots = λimm:Formula, rs1:Formula, funct3:Formula, rd:Formula, opcode:Formula.
+  [slot "imm[11:0]" 20:int32 12:int32 imm, slot "rs1" 15:int32 5:int32 rs1, slot "funct3" 12:int32 3:int32 funct3,
+   slot "rd" 7:int32 5:int32 rd, slot "opcode" 0:int32 7:int32 opcode]
+
+## The fields of an S-type word: imm[11:5] rs2 rs1 funct3 imm[4:0] opcode.
+term sSlots = λimm:string, rs2:Formula, rs1:Formula, funct3:Formula, opcode:Formula.
+  [slot "imm[11:5]" 25:int32 7:int32 (bitsOf imm 5:int32 7:int32), slot "rs2" 20:int32 5:int32 rs2, slot "rs1" 15:int32 5:int32 rs1,
+   slot "funct3" 12:int32 3:int32 funct3, slot "imm[4:0]" 7:int32 5:int32 (bitsOf imm 0:int32 5:int32), slot "opcode" 0:int32 7:int32 opcode]
+
+## The fields of a B-type word: imm[12|10:5] rs2 rs1 funct3 imm[4:1|11] opcode.
+term bSlots = λoffset:string, rs2:Formula, rs1:Formula, funct3:Formula, opcode:Formula.
+  [slot "imm[12]" 31:int32 1:int32 (bitsOf offset 12:int32 1:int32), slot "imm[10:5]" 25:int32 6:int32 (bitsOf offset 5:int32 6:int32),
+   slot "rs2" 20:int32 5:int32 rs2, slot "rs1" 15:int32 5:int32 rs1, slot "funct3" 12:int32 3:int32 funct3,
+   slot "imm[4:1]" 8:int32 4:int32 (bitsOf offset 1:int32 4:int32), slot "imm[11]" 7:int32 1:int32 (bitsOf offset 11:int32 1:int32),
+   slot "opcode" 0:int32 7:int32 opcode]
+
+## The fields of a U-type word: imm[31:12] rd opcode.
+term uSlots = λimm:string, rd:Formula, opcode:Formula.
+  [slot "imm[31:12]" 12:int32 20:int32 (bitsOf imm 0:int32 20:int32), slot "rd" 7:int32 5:int32 rd, slot "opcode" 0:int32 7:int32 opcode]
+
+## The fields of a J-type word: imm[20|10:1|11|19:12] rd opcode.
+term jSlots = λoffset:string, rd:Formula, opcode:Formula.
+  [slot "imm[20]" 31:int32 1:int32 (bitsOf offset 20:int32 1:int32), slot "imm[10:1]" 21:int32 10:int32 (bitsOf offset 1:int32 10:int32),
+   slot "imm[11]" 20:int32 1:int32 (bitsOf offset 11:int32 1:int32), slot "imm[19:12]" 12:int32 8:int32 (bitsOf offset 12:int32 8:int32),
+   slot "rd" 7:int32 5:int32 rd, slot "opcode" 0:int32 7:int32 opcode]
+
+## Record an instruction word at offset: one image atom per field.
+term addSlots = λr:Recording, offset:int32, format:string, slots:list<Slot>.
+  eithers.foldList
+    (λr1:Recording, s:Slot. addDerived r1 (imageKey offset (Slot[field] s)) (imagePlace offset (Slot[lo] s) (Slot[width] s)) (Slot[formula] s) (ruleOf format (Slot[field] s)))
+    r slots
 
 ## Encode an I-type instruction (addi, andi, jalr, lbu).
-term encodeI = λmnemonic:string, opcode:int32, funct3:int32, i:IType.
+term encodeI = λmnemonic:string, k:int32, pc:int32, trace:ItemTrace, r:Recording.
   do either {
-    rd := registerNumber (IType[rd] i),
-    rs1 := registerNumber (IType[rs1] i),
-    imm := checkRange mnemonic "immediate" (IType[imm] i) -2048:int32 2047:int32,
-    eithers.right (iFields imm rs1 funct3 rd opcode)}
+    rd := operandOf k trace "rd",
+    rs1 := operandOf k trace "rs1",
+    imm := operandOf k trace "imm",
+    rdChecked := checkedRegister r rd,
+    rs1Checked := checkedRegister r rs1,
+    immChecked := checkedNumber r imm mnemonic "immediate" -2048:bigint 2047:bigint,
+    addSlots r pc "iSlots" (iSlots (bitsOf imm 0:int32 12:int32) (copyOf rs1) (copyOf (fixedKey mnemonic "funct3")) (copyOf rd) (copyOf (opcodeKey mnemonic)))}
 
 ## Encode an S-type store (sb, sw).
-term encodeS = λmnemonic:string, funct3:int32, s:SType.
+term encodeS = λmnemonic:string, k:int32, pc:int32, trace:ItemTrace, r:Recording.
   do either {
-    base := registerNumber (SType[rs1] s),
-    src := registerNumber (SType[rs2] s),
-    imm := checkRange mnemonic "immediate" (SType[imm] s) -2048:int32 2047:int32,
-    eithers.right (sFields imm src base funct3 35:int32)}
+    base := operandOf k trace "rs1",
+    src := operandOf k trace "rs2",
+    imm := operandOf k trace "imm",
+    baseChecked := checkedRegister r base,
+    srcChecked := checkedRegister r src,
+    immChecked := checkedNumber r imm mnemonic "immediate" -2048:bigint 2047:bigint,
+    addSlots r pc "sSlots" (sSlots imm (copyOf src) (copyOf base) (copyOf (fixedKey mnemonic "funct3")) (copyOf (opcodeKey mnemonic)))}
 
-## Encode one instruction placed at offset pc.
-term encodeInstruction = λlabels:map<string, int32>, pc:int32, instruction:Instruction.
+## Encode beq.
+term encodeBranch = λk:int32, pc:int32, trace:ItemTrace, r:Recording.
+  do either {
+    rs1 := operandOf k trace "rs1",
+    rs2 := operandOf k trace "rs2",
+    target := operandOf k trace "target",
+    rs1Checked := checkedRegister r rs1,
+    rs2Checked := checkedRegister r rs2,
+    r1 := recordOffset r "beq" true k pc target,
+    offsetChecked := checkedNumber r1 (wordKey pc "offset") "beq" "offset" -4096:bigint 4094:bigint,
+    addSlots r1 pc "bSlots" (bSlots (wordKey pc "offset") (copyOf rs2) (copyOf rs1) (copyOf (fixedKey "beq" "funct3")) (copyOf (opcodeKey "beq")))}
+
+## Encode jal.
+term encodeJump = λk:int32, pc:int32, trace:ItemTrace, r:Recording.
+  do either {
+    rd := operandOf k trace "rd",
+    target := operandOf k trace "target",
+    rdChecked := checkedRegister r rd,
+    r1 := recordOffset r "jal" true k pc target,
+    offsetChecked := checkedNumber r1 (wordKey pc "offset") "jal" "offset" -1048576:bigint 1048574:bigint,
+    addSlots r1 pc "jSlots" (jSlots (wordKey pc "offset") (copyOf rd) (copyOf (opcodeKey "jal")))}
+
+## Encode lui.
+term encodeUpper = λk:int32, pc:int32, trace:ItemTrace, r:Recording.
+  do either {
+    rd := operandOf k trace "rd",
+    imm := operandOf k trace "imm",
+    rdChecked := checkedRegister r rd,
+    immChecked := checkedNumber r imm "lui" "immediate" 0:bigint 1048575:bigint,
+    addSlots r pc "uSlots" (uSlots imm (copyOf rd) (copyOf (opcodeKey "lui")))}
+
+## Encode la: auipc adds the upper part of the offset, in pages, and addi the lower part.
+term encodeLoadAddress = λc:Constants, k:int32, pc:int32, trace:ItemTrace, r:Recording.
+  let offset := wordKey pc "offset",
+      rounded := wordKey pc "offset+half",
+      upper := wordKey pc "upper",
+      scaled := wordKey pc "upper*page",
+      lower := wordKey pc "lower"
+  in do either {
+    rd := operandOf k trace "rd",
+    target := operandOf k trace "target",
+    rdChecked := checkedRegister r rd,
+    r1 := recordOffset r "la" false k pc target,
+    offsetChecked := checkedNumber r1 offset "la" "offset" -2147483648:bigint 2147481599:bigint,
+    r2 := addDerived r1 rounded (intermediate "la: the offset plus half a page")
+      (inject(hydraos.riscv.derivation.Formula){sum = [atomId offset, atomId "encode/pageHalf"]}) (ruleOf "encodeLoadAddress" "offset + pageHalf"),
+    r3 := addDerived r2 upper (intermediate "la: the upper part, in pages")
+      (inject(hydraos.riscv.derivation.Formula){quotient = Operands{x = atomId rounded, y = atomId "encode/pageSize"}}) (ruleOf "encodeLoadAddress" "(offset + pageHalf) div pageSize"),
+    r4 := addDerived r3 scaled (intermediate "la: the upper part, in bytes")
+      (inject(hydraos.riscv.derivation.Formula){product = Operands{x = atomId upper, y = atomId "encode/pageSize"}}) (ruleOf "encodeLoadAddress" "upper * pageSize"),
+    r5 := addDerived r4 lower (intermediate "la: the lower part")
+      (inject(hydraos.riscv.derivation.Formula){difference = Operands{x = atomId offset, y = atomId scaled}}) (ruleOf "encodeLoadAddress" "offset - upper * pageSize"),
+    r6 := addSlots r5 pc "uSlots" (uSlots upper (copyOf rd) (copyOf (opcodeKey "la.auipc"))),
+    addSlots r6 (math.add pc (Constants[instructionSize] c)) "iSlots"
+      (iSlots (bitsOf lower 0:int32 12:int32) (copyOf rd) (copyOf (fixedKey "la.addi" "funct3")) (copyOf rd) (copyOf (opcodeKey "la.addi")))}
+
+## Encode wfi, a SYSTEM instruction whose fields are all fixed.
+term encodeWait = λpc:int32, r:Recording.
+  addSlots r pc "iSlots" (iSlots (copyOf (fixedKey "wfi" "funct12")) (copyOf (fixedKey "wfi" "rs1")) (copyOf (fixedKey "wfi" "funct3"))
+    (copyOf (fixedKey "wfi" "rd")) (copyOf (opcodeKey "wfi")))
+
+## Encode one instruction placed at pc; also the number of bytes it takes.
+term encodeInstruction = λc:Constants, k:int32, pc:int32, trace:ItemTrace, r:Recording, instruction:Instruction.
   cases(hydraos.riscv.model.Instruction){
-    addi = λi:IType. encodeI "addi" 19:int32 0:int32 i,
-    andi = λi:IType. encodeI "andi" 19:int32 7:int32 i,
-    beq = λb:Branch. do either {
-      rs1 := registerNumber (Branch[rs1] b),
-      rs2 := registerNumber (Branch[rs2] b),
-      offset := targetOffset "beq" true labels pc (Branch[target] b),
-      checked := checkRange "beq" "offset" offset -4096:int32 4094:int32,
-      eithers.right (bFields checked rs2 rs1 0:int32 99:int32)},
-    jal = λj:Jump. do either {
-      rd := registerNumber (Jump[rd] j),
-      offset := targetOffset "jal" true labels pc (Jump[target] j),
-      checked := checkRange "jal" "offset" offset -1048576:int32 1048574:int32,
-      eithers.right (jFields checked rd 111:int32)},
-    jalr = λi:IType. encodeI "jalr" 103:int32 0:int32 i,
-    la = λl:LoadAddress. do either {
-      rd := registerNumber (LoadAddress[rd] l),
-      offset := targetOffset "la" false labels pc (LoadAddress[target] l),
-      checked := checkRange "la" "offset" offset -2147483648:int32 2147481599:int32,
-      eithers.right (
-        let hi := quotient (math.add checked 2048:bigint) 4096:bigint,
-            lo := math.sub checked (math.mul hi 4096:bigint)
-        in lists.concat2 (uFields hi rd 23:int32) (iFields lo rd 0:int32 rd 19:int32))},
-    lbu = λi:IType. encodeI "lbu" 3:int32 4:int32 i,
-    lui = λu:UType. do either {
-      rd := registerNumber (UType[rd] u),
-      imm := checkRange "lui" "immediate" (UType[imm] u) 0:int32 1048575:int32,
-      eithers.right (uFields imm rd 55:int32)},
-    sb = λs:SType. encodeS "sb" 0:int32 s,
-    sw = λs:SType. encodeS "sw" 2:int32 s,
-    wfi = λ`_`. eithers.right (wordBytes 273678451:bigint)}
+    addi = λi:IType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeI "addi" k pc trace r),
+    andi = λi:IType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeI "andi" k pc trace r),
+    beq = λb:Branch. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeBranch k pc trace r),
+    jal = λj:Jump. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeJump k pc trace r),
+    jalr = λi:IType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeI "jalr" k pc trace r),
+    la = λl:LoadAddress. eithers.map (λr1:Recording. (r1, 8:int32)) (encodeLoadAddress c k pc trace r),
+    lbu = λi:IType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeI "lbu" k pc trace r),
+    lui = λu:UType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeUpper k pc trace r),
+    sb = λs:SType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeS "sb" k pc trace r),
+    sw = λs:SType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeS "sw" k pc trace r),
+    wfi = λ`_`. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeWait pc r)}
   instruction
 
-## The size of an item in the image, in bytes.
-term itemSize = λitem:Item.
-  cases(hydraos.riscv.model.Item){
-    label = λl:Label. 0:int32,
-    instruction = λi:Instruction. cases(hydraos.riscv.model.Instruction){la = λl:LoadAddress. 8:int32, `_` = 4:int32} i,
-    data = λb:binary. lists.length (literals.binaryToBytes b)}
-  item
+## Copy a data item's bytes into the image at pc; also the number of bytes.
+term encodeData = λpc:int32, trace:ItemTrace, r:Recording.
+  eithers.map (λacc:(int32, Recording). (pairs.second acc, pairs.first acc))
+    (eithers.foldList
+      (λacc:(int32, Recording), key:string.
+        let j := pairs.first acc,
+            offset := math.add pc j
+        in eithers.map (λr1:Recording. (math.add j 1:int32, r1))
+          (addDerived (pairs.second acc) (imageKey offset "byte") (imagePlace offset 0:int32 8:int32) (copyOf key)
+            (ruleOf "encodeData" (strings.concat2 "data byte " (literals.printInt32 j)))))
+      (0:int32, r)
+      (dataBytes trace))
 
-## One layout step: (offset, labels so far) and an item give the next (offset, labels).
-term layoutStep = λstate:(int32, map<string, int32>), item:Item.
-  let offset := pairs.first state,
-      labels := pairs.second state,
-      next := math.add offset (itemSize item)
-  in cases(hydraos.riscv.model.Item){
-    label = λl:Label. logic.ifElse (maps.member (Label[] l) labels)
-      (eithers.left (strings.concat ["duplicate label ", Label[] l]))
-      (eithers.right (offset, maps.insert (Label[] l) offset labels)),
-    instruction = λi:Instruction. logic.ifElse (equality.equal (modulo32 offset 4:int32) 0:int32)
-      (eithers.right (next, labels))
-      (eithers.left (strings.concat ["instruction at offset ", literals.printInt32 offset, " is not 4-byte aligned"])),
-    data = λb:binary. eithers.right (next, labels)}
-  item
+## Pass 2 for item k: record its fields in the image, and check that it took the size pass 1 recorded.
+term encodeItem = λc:Constants, r:Recording, kit:(int32, (Item, ItemTrace)).
+  let k := pairs.first kit,
+      item := pairs.first (pairs.second kit),
+      trace := pairs.second (pairs.second kit)
+  in do either {
+    pc := numberIn r (pcKey k),
+    size := numberIn r (sizeKey k),
+    encoded := cases(hydraos.riscv.model.Item){
+        label = λl:Label. eithers.right (r, 0:int32),
+        instruction = λi:Instruction. encodeInstruction c k (literals.bigintToInt32 pc) trace r i,
+        data = λb:binary. encodeData (literals.bigintToInt32 pc) trace r}
+      item,
+    logic.ifElse (equality.equal (literals.int32ToBigint (pairs.second encoded)) size)
+      (eithers.right (pairs.first encoded))
+      (eithers.left (strings.concat ["item ", literals.printInt32 k, ": encoded ", literals.printInt32 (pairs.second encoded), " bytes, recorded size ", literals.printBigint size]))}
 
-## Pass 1: the offset of every label.
-term layout = λitems:list<Item>.
-  eithers.map (λstate:(int32, map<string, int32>). pairs.second state) (eithers.foldList layoutStep (0:int32, maps.empty) items)
+## The operand atoms of a program built directly, without sources: each value is stated by the program.
+term untracedItem = λki:(int32, Item).
+  let k := pairs.first ki,
+      operand := λrole:string, v:Value. (OperandAtom{role = role, atom = atomId (operandKey k role)},
+        stated (operandKey k role) (intermediate (strings.concat ["item ", literals.printInt32 k, " ", role])) v (ruleOf "untraced" "stated by the program")),
+      register := λrole:string, x:Register. operand role (number (literals.int32ToBigint (Register[] x))),
+      immediate := λx:int32. operand "imm" (number (literals.int32ToBigint x)),
+      target := λx:Label. operand "target" (inject(hydraos.riscv.derivation.Value){name = Label[] x}),
+      iType := λi:IType. [register "rd" (IType[rd] i), register "rs1" (IType[rs1] i), immediate (IType[imm] i)],
+      sType := λs:SType. [register "rs1" (SType[rs1] s), register "rs2" (SType[rs2] s), immediate (SType[imm] s)],
+      operands := cases(hydraos.riscv.model.Item){
+        label = λl:Label. [],
+        data = λb:binary. lists.map
+          (λjb:(int32, int32). (OperandAtom{role = "byte", atom = atomId (operandKey k (strings.concat2 "byte/" (literals.printInt32 (pairs.first jb))))},
+            stated (operandKey k (strings.concat2 "byte/" (literals.printInt32 (pairs.first jb))))
+              (intermediate (strings.concat ["item ", literals.printInt32 k, " byte ", literals.printInt32 (pairs.first jb)]))
+              (number (literals.int32ToBigint (pairs.second jb))) (ruleOf "untraced" "stated by the program")))
+          (numbered (literals.binaryToBytes b)),
+        instruction = λi:Instruction. cases(hydraos.riscv.model.Instruction){
+            addi = iType, andi = iType, jalr = iType, lbu = iType,
+            sb = sType, sw = sType,
+            beq = λb:Branch. [register "rs1" (Branch[rs1] b), register "rs2" (Branch[rs2] b), target (Branch[target] b)],
+            jal = λj:Jump. [register "rd" (Jump[rd] j), target (Jump[target] j)],
+            la = λl:LoadAddress. [register "rd" (LoadAddress[rd] l), target (LoadAddress[target] l)],
+            lui = λu:UType. [register "rd" (UType[rd] u), immediate (UType[imm] u)],
+            wfi = λ`_`. []}
+          i}
+        (pairs.second ki)
+  in (ItemTrace{place = none, operands = lists.map pairs.first operands}, lists.map pairs.second operands)
 
-## One encoding step: (offset, byte chunks so far, newest first) and an item give the next state.
-term encodeStep = λlabels:map<string, int32>, state:(int32, list<list<int32>>), item:Item.
-  let offset := pairs.first state,
-      chunks := pairs.second state,
-      next := math.add offset (itemSize item)
-  in eithers.map (λbytes:list<int32>. (next, lists.cons bytes chunks))
-    (cases(hydraos.riscv.model.Item){
-      label = λl:Label. eithers.right [],
-      instruction = λi:Instruction. encodeInstruction labels offset i,
-      data = λb:binary. eithers.right (literals.binaryToBytes b)}
-    item)
+## A program built directly, without sources: every operand is an atom stated by the program.
+term untraced = λp:Program.
+  let traced := lists.map untracedItem (numbered (Program[] p))
+  in TracedProgram{program = p, items = lists.map pairs.first traced, atoms = lists.concat (lists.map pairs.second traced)}
+
+## Encode a traced program with the given constants: record the constants, lay the items out, derive every
+## field of every instruction, and assemble the image from the image atoms.
+term encodeWith = λc:Constants, tp:TracedProgram.
+  let items := Program[] (TracedProgram[program] tp),
+      traces := TracedProgram[items] tp,
+      steps := numbered (lists.zip items traces)
+  in do either {
+    lengths := logic.ifElse (equality.equal (lists.length items) (lists.length traces))
+      (eithers.right unit)
+      (eithers.left (strings.concat ["encode: ", literals.printInt32 (lists.length items), " items but ", literals.printInt32 (lists.length traces), " item traces"])),
+    r0 := recordConstants c (recordingOf (TracedProgram[atoms] tp)),
+    r1 := eithers.foldList layoutItem r0 steps,
+    r2 := eithers.foldList (encodeItem c) r1 steps,
+    image := assemble (recorded r2),
+    eithers.right (Traced{image = image, derivation = wrap(hydraos.riscv.derivation.Derivation){recorded r2}, coverage = coverage (wrap(hydraos.riscv.derivation.Derivation){recorded r2})})}
+
+## Encode a traced program with this module's constants.
+term encodeTraced = λtp:TracedProgram. encodeWith constants tp
 
 ## Encode a program as a flat little-endian image, or report the first problem found.
-term encodeProgram = λp:Program.
-  let items := Program[] p
-  in do either {
-    labels := layout items,
-    final := eithers.foldList (encodeStep labels) (0:int32, []) items,
-    eithers.right (literals.base64ToBinary (base64 (lists.concat (lists.reverse (pairs.second final)))))}
+term encodeProgram = λp:Program. eithers.map (λt:Traced. Traced[image] t) (encodeTraced (untraced p))
