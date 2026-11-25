@@ -118,8 +118,8 @@ operand in `runtime.hydra` and `coder.hydra`, each register number in `dsl.hydra
 image with what the record predicts for that change. Every build that succeeds must match its
 prediction bit for bit. Builds that one of the encoder's own checks rejects (a value out of range, a
 misaligned target, a size that disagrees with the encoding) are listed with their error; any other
-failed build fails the check. A full run takes about five hours with 8 builds at a time, and about 4 GB
-of memory. The report of the last full run, with every change and its outcome, is in
+failed build fails the check. A full run takes about three and a half hours with 8 builds at a time,
+and about 4 GB of memory. The report of the last full run, with every change and its outcome, is in
 [docs/evidence](docs/evidence/2026-11-25-derivation-check.txt).
 
 ### Keep it current
