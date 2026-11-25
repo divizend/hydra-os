@@ -78,8 +78,9 @@ type TracedProgram = record{program: Program, items: list<ItemTrace>, atoms: lis
 ## text, and the number of atoms.
 type Coverage = record{bits: int32, sourceBits: int32, atoms: int32}
 
-## A boot image with its derivation.
-type Traced = record{image: binary, derivation: Derivation, coverage: Coverage}
+## A boot image with its derivation, how much of the image the derivation explains, and where each item of
+## the program came from.
+type Traced = record{image: binary, derivation: Derivation, coverage: Coverage, items: list<ItemTrace>}
 
 ## One field of an instruction word: its name, its lowest bit, its width, and the formula of its value.
 type Slot = record{field: string, lo: int32, width: int32, formula: Formula}

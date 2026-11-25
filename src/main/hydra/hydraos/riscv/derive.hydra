@@ -254,24 +254,31 @@ term references = λvalues:map<string, Value>, f:Formula.
         v))}
   f
 
-## Whether every stated atom that an atom depends on lies in source text.
-term rootedInSource = λbyId:map<string, Atom>, values:map<string, Value>, a:Atom.
-  cases(hydraos.riscv.derivation.Formula){
-    stated = λu:unit. cases(hydraos.riscv.derivation.Place){source = λs:SourcePlace. true, `_` = false} (Atom[place] a),
-    `_` = lists.foldl
-      (λok:boolean, r:AtomId. logic.and ok (optionals.match (maps.lookup (AtomId[] r) byId) false (λb:Atom. rootedInSource byId values b)))
-      true
-      (references values (Atom[formula] a))}
-  (Atom[formula] a)
+## Whether each atom's value rests only on atoms stated in source text: a stated atom when it lies in a
+## source, any other atom when every atom it refers to does. One pass in the derivation's order, so an atom
+## that refers to a later atom, or to one never recorded, does not count.
+term rootedness = λvalues:map<string, Value>, atoms:list<Atom>.
+  lists.foldl
+    (λrooted:map<string, boolean>, a:Atom.
+      maps.insert (AtomId[] (Atom[id] a))
+        (cases(hydraos.riscv.derivation.Formula){
+            stated = λu:unit. cases(hydraos.riscv.derivation.Place){source = λs:SourcePlace. true, `_` = false} (Atom[place] a),
+            `_` = lists.foldl
+              (λok:boolean, r:AtomId. logic.and ok (maps.findWithDefault false (AtomId[] r) rooted))
+              true
+              (references values (Atom[formula] a))}
+          (Atom[formula] a))
+        rooted)
+    maps.empty
+    atoms
 
 ## How much of the image a derivation explains.
 term coverage = λd:Derivation.
   let atoms := Derivation[] d,
-      byId := maps.fromList (lists.map (λa:Atom. (AtomId[] (Atom[id] a), a)) atoms),
-      values := atomValues atoms,
+      rooted := rootedness (atomValues atoms) atoms,
       widths := lists.map
         (λa:Atom. cases(hydraos.riscv.derivation.Place){
-          image = λp:ImagePlace. (ImagePlace[width] p, rootedInSource byId values a),
+          image = λp:ImagePlace. (ImagePlace[width] p, maps.findWithDefault false (AtomId[] (Atom[id] a)) rooted),
           `_` = (0:int32, false)}
           (Atom[place] a))
         atoms

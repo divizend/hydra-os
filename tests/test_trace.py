@@ -112,6 +112,34 @@ def test_every_bit_of_hello_traces_back_to_source(hello):
     assert (hello.coverage.bits, hello.coverage.source_bits) == (840, 840)
 
 
+def test_the_record_keeps_where_each_item_was_written(d, hello):
+    items = list(hello.items)
+    assert len(items) == 29
+    wfi, data = items[6], items[28]
+    assert (wfi.place.value.definition, subterm_path(wfi.place.value.path), list(wfi.operands)) == (
+        "hydraos.riscv.runtime.startup", "listElement:6", [])
+    assert (data.place.value.definition, subterm_path(data.place.value.path)) == (
+        "hydraos.riscv.coder.mainProgram", "lambdaBody/wrapBody/applicationArgument/listElement:3/listElement:1")
+    assert [(o.role, o.atom.value) for o in data.operands] == [("byte", f"message/{k}") for k in range(17)]
+
+
+def test_an_untraced_build_keeps_no_places(enc, hello_program):
+    r = enc.encode_traced(enc.untraced(hello_program))
+    assert isinstance(r, Right), r
+    assert len(r.value.items) == 29 and all(isinstance(i.place, None_) for i in r.value.items)
+
+
+def test_la_rejects_a_lower_part_that_does_not_fit_its_immediate(enc, hello_program):
+    # la main.message at offset 28: 60 + 6144 rounds to one page, leaving -4036 for addi's 12 bits.
+    r = enc.encode_with(enc.constants().with_page_half(6144), enc.untraced(hello_program))
+    assert r == Left("la: lower part -4036 out of range [-2048, 2047]")
+
+
+def test_la_rejects_an_upper_part_that_does_not_fit_auipc(enc, hello_program):
+    r = enc.encode_with(enc.constants().with_page_size(1).with_page_half(600000), enc.untraced(hello_program))
+    assert r == Left("la: upper part 600060 out of range [-524288, 524287]")
+
+
 def test_byte_0x31_reaches_its_register_its_encoding_and_its_branch_target(d, derive, hello):
     by_id = atoms_by_id(hello)
     assert atoms_of_byte(d, hello, 0x31) == ["image/48/funct3", "image/48/imm[4:1]", "image/48/rs1"]

@@ -12,12 +12,22 @@ Each mutation changes one source atom of the record (hydraos.riscv.derivation) i
 Derived atoms, the names labels define, and the program's structure are not mutated (see the spec).
 Every mutated copy is built with `python -m launcher build` in a fresh process, and the image is compared
 with what the record predicts: hydraos.riscv.derive.predict, the derivation evaluated again with that one
-atom's value changed. A build that succeeds must give the predicted image bit for bit; a build the
-encoder rejects is listed with its error.
+atom's value changed. Each mutation ends in one of four outcomes:
+
+- matched: the build succeeded and its image is the predicted one, bit for bit;
+- rejected: one of the encoder's own checks refused the program (a value out of range, a misaligned
+  instruction or target, an undefined or duplicate label, a size that disagrees with the encoding, a
+  division by zero), which the prediction does not model;
+- failed: the build failed for any other reason (a source that does not parse, a trace that disagrees
+  with what Hydra evaluated, a crash or a timeout), which is a fault of the check or of the build;
+- mismatched: the build succeeded with another image than the predicted one.
+
+The check passes when nothing failed or mismatched.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +43,21 @@ from hydra.core.print.model import escape_string_char
 from launcher.pipeline import REPO_ROOT, SOURCE_ROOT
 
 KINDS = ("character", "number", "register", "label")
+OUTCOMES = ("matched", "rejected", "failed", "mismatched")
+
+# The errors of the encoder's own checks (hydraos.riscv.encode: inRange, checkedRegister, recordEncoding,
+# layoutItem, recordOffset, encodeItem) and of the evaluator's division (hydraos.riscv.derive.evaluate).
+REJECTIONS = [re.compile(p) for p in (
+    r"[\w.]+: .+ -?\d+ out of range \[-?\d+, -?\d+\]",
+    r"register -?\d+ out of range \[0, 31\]",
+    r"[\w.]+: no fixed field is called .+",
+    r"duplicate label .+",
+    r"instruction at offset -?\d+ is not 4-byte aligned",
+    r"[\w.]+: undefined label .+",
+    r"[\w.]+: target .+ at offset -?\d+ is not 4-byte aligned",
+    r"item \d+: encoded \d+ bytes, recorded size -?\d+",
+    r"derivation: division by zero in .+",
+)]
 
 
 @dataclass(frozen=True)
@@ -64,7 +89,7 @@ class Mutation:
 @dataclass(frozen=True)
 class Result:
     mutation: Mutation
-    outcome: str  # "matched", "rejected" or "mismatched"
+    outcome: str  # one of OUTCOMES
     detail: str  # the build's error, or how the image differs from the prediction
 
 
@@ -158,7 +183,7 @@ def run(
     predictions = [predict(m) for m in mutations]
     results: list[Result | None] = [None] * len(mutations)
     with tempfile.TemporaryDirectory(prefix="hydra-os-check-") as work, ThreadPoolExecutor(jobs) as pool:
-        futures = {pool.submit(_rebuild, m, Path(work) / f"m{i:04}"): i for i, m in enumerate(mutations)}
+        futures = {pool.submit(rebuild, m, Path(work) / f"m{i:04}"): i for i, m in enumerate(mutations)}
         for done, future in enumerate(as_completed(futures), 1):
             i = futures[future]
             image, error = future.result()
@@ -168,22 +193,23 @@ def run(
 
 
 def report(results: Sequence[Result], header: Sequence[str]) -> str:
-    """The check's report: a summary per kind, the rejected builds, the mismatches, then every mutation."""
-    lines = list(header) + ["", f"{'kind':<10} {'mutations':>9} {'matched':>8} {'rejected':>9} {'mismatched':>11}"]
+    """The check's report: a summary per kind, the rejected builds, the failures, the mismatches, then every
+    mutation."""
+    lines = list(header) + ["", f"{'kind':<10} {'mutations':>9} {'matched':>8} {'rejected':>9} {'failed':>7} {'mismatched':>11}"]
     for kind in (*KINDS, "total"):
         of = [r for r in results if kind in (r.mutation.kind, "total")]
         n = Counter(r.outcome for r in of)
-        lines.append(f"{kind:<10} {len(of):>9} {n['matched']:>8} {n['rejected']:>9} {n['mismatched']:>11}")
-    for title, outcome in (("Rejected by the build", "rejected"), ("Mismatched", "mismatched")):
+        lines.append(f"{kind:<10} {len(of):>9} {n['matched']:>8} {n['rejected']:>9} {n['failed']:>7} {n['mismatched']:>11}")
+    for title, outcome in (("Rejected by the encoder", "rejected"), ("Failed", "failed"), ("Mismatched", "mismatched")):
         found = [r for r in results if r.outcome == outcome]
         lines += ["", f"{title}: {len(found)}"] + [f"  {r.mutation}\n    {r.detail}" for r in found]
     lines += ["", "Every mutation:"] + [f"  {r.outcome:<10} {r.mutation}" for r in results]
     return "\n".join(lines) + "\n"
 
 
-def _rebuild(mutation: Mutation, work: Path) -> tuple[bytes | None, str]:
+def rebuild(mutation: Mutation, work: Path) -> tuple[bytes | None, str]:
     """Build a copy of the sources with the mutation applied, in a fresh process: the image, or None and the
-    build's error."""
+    build's error. Whatever goes wrong is reported, never raised, so one mutation cannot end the run."""
     root = work / "src"
     try:
         shutil.copytree(SOURCE_ROOT, root)
@@ -195,13 +221,20 @@ def _rebuild(mutation: Mutation, work: Path) -> tuple[bytes | None, str]:
             return out.read_bytes(), ""
         errors = [line.removeprefix("error: ") for line in r.stderr.splitlines() if line.startswith("error: ")]
         return None, errors[-1] if errors else f"exit status {r.returncode}: {r.stderr.strip().splitlines()[-1:]}"
+    except Exception as e:  # noqa: BLE001 - reported as the mutation's outcome
+        return None, f"the rebuild did not finish: {type(e).__name__}: {e}"
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def is_rejection(error: str) -> bool:
+    """Whether a build's error is one of the encoder's own checks refusing the program."""
+    return any(p.fullmatch(error) for p in REJECTIONS)
+
+
 def compare(mutation: Mutation, predicted: tuple[bytes | None, str], image: bytes | None, error: str) -> Result:
     if image is None:
-        return Result(mutation, "rejected", error)
+        return Result(mutation, "rejected" if is_rejection(error) else "failed", error)
     expected, why = predicted
     if expected is None:
         return Result(mutation, "mismatched", f"the build succeeded, but the record predicts no image: {why}")

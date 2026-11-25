@@ -100,3 +100,11 @@ def test_coverage_counts_bits_and_bits_traced_to_source(d, derive):
     source = d.PlaceSource(d.SourcePlace("hydraos.hello.main", SubtermPath(ConsList.of()), Given(0)))
     assert derive.coverage(char_derivation(d, source)) == d.Coverage(8, 8, 3)
     assert derive.coverage(char_derivation(d, None)) == d.Coverage(8, 0, 3)
+
+
+def test_an_atom_that_refers_to_a_later_atom_is_not_traced_to_source(d, derive):
+    # A derivation lists each atom after the atoms its formula refers to; coverage reads it in one pass.
+    source = d.PlaceSource(d.SourcePlace("hydraos.hello.main", SubtermPath(ConsList.of()), Given(0)))
+    out = image(d, "out", 0, 0, 8, 0x48, d.FormulaCopy(d.AtomId("char")))
+    char = atom(d, "char", ord("H"), place=source)
+    assert derive.coverage(d.Derivation(ConsList.of(out, char))) == d.Coverage(8, 0, 2)

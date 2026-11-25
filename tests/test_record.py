@@ -5,11 +5,13 @@ import json
 import subprocess
 
 import pytest
-from hydra.core.overlay.python.dsl.python import Right
+from hydra.core.overlay.python.dsl.python import None_, Right
+from hydra.core.overlay.python.util.cons_list import ConsList
+from hydra.core.paths import SubtermPath
 
 from helpers import GOLDEN_IMAGE, run_launcher
 from launcher.pipeline import REPO_ROOT
-from launcher.record import record_json
+from launcher.record import Resolver, record_json
 
 HELLO_SOURCE = "src/main/hydra/hydraos/hello.hydra"
 
@@ -94,3 +96,20 @@ def test_build_writes_the_committed_record_beside_the_image(tmp_path):
     assert fresh == (REPO_ROOT / "out" / "hello.derivation.json").read_text(encoding="utf-8")
     atoms = len(json.loads(fresh)["atoms"])
     assert f"derivation: 840 of 840 bits explained, 840 traced to source, {atoms} atoms" in err
+
+
+def test_every_item_resolves_to_the_call_that_wrote_it(record):
+    items = record["items"]
+    assert len(items) == 29
+    assert [i["place"]["span"]["text"] for i in items[5:8]] == ['label "halt"', "wfi", 'jal zero "halt"']
+    assert items[6]["operands"] == []
+    assert items[28]["place"]["span"]["text"] == "data bytes"
+    assert items[28]["operands"][0] == {"role": "byte", "atom": "message/0"}
+
+
+def test_a_definition_with_a_type_signature_resolves(project):
+    d = project.module("hydraos.riscv.derivation")
+    text = "## A module.\nmodule m\n\n## The answer.\nterm answer : int32 = 42:int32\n"
+    resolve = Resolver({"m": ("m.hydra", text)}, lambda file: None)
+    span = resolve(d.SourcePlace("m.answer", SubtermPath(ConsList.of()), None_()))
+    assert (span["text"], span["line"], span["column"]) == ("42:int32", 5, 23)

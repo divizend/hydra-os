@@ -92,6 +92,9 @@ constant of the encoder, an offset or a field of an instruction. Each atom has
   difference, product, quotient, bits, count, utf8 or labelOffset;
 - a rule: the Hydra definition whose code applied that formula.
 
+The record also lists the program's 29 items, each with the call that wrote it (`wfi`, item 6, is
+written in `runtime.hydra`'s `startup`) and the atoms of its operands.
+
 The encoder computes every field of the image through these formulas and assembles the image from the
 atoms that live in it, so the bytes and their explanation are one computation; the build fails if the
 atoms do not tile the image exactly. Following any field back ends in source text. Byte 0x31, for
@@ -113,15 +116,19 @@ This changes one source atom at a time in a copy of the sources (each character 
 operand in `runtime.hydra` and `coder.hydra`, each register number in `dsl.hydra`, each constant in
 `encode.hydra`: 694 changes), rebuilds each copy with `build` in a fresh process, and compares the
 image with what the record predicts for that change. Every build that succeeds must match its
-prediction bit for bit; builds the encoder rejects are listed with their error. The report of the last
-full run, with every change and its outcome, is in
+prediction bit for bit. Builds that one of the encoder's own checks rejects (a value out of range, a
+misaligned target, a size that disagrees with the encoding) are listed with their error; any other
+failed build fails the check. A full run takes about five hours with 8 builds at a time, and about 4 GB
+of memory. The report of the last full run, with every change and its outcome, is in
 [docs/evidence](docs/evidence/2026-11-25-derivation-check.txt).
 
 ### Keep it current
 
 Each span's link pins the commit that last changed its file. After changing a `.hydra` file, commit it
 first, then run `build` and commit the new record; `tests/test_record.py` fails while the committed
-record differs from a fresh build.
+record differs from a fresh build. Merge such commits as they are, with a merge commit or a
+fast-forward: a squash or a rebase gives them new commits, and the record's links would then name
+commits the merged branch does not have, until the record is built and committed again.
 
 ## Run it on Hydra's Python host
 

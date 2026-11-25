@@ -306,7 +306,8 @@ term encodeUpper = λk:int32, pc:int32, trace:ItemTrace, r:Recording.
     immChecked := checkedNumber r imm "lui" "immediate" 0:bigint 1048575:bigint,
     addSlots r pc "uSlots" (uSlots imm (copyOf rd) (copyOf (opcodeKey "lui")))}
 
-## Encode la: auipc adds the upper part of the offset, in pages, and addi the lower part.
+## Encode la: auipc adds the upper part of the offset, in pages, and addi the lower part; each part must fit
+## its instruction's immediate.
 term encodeLoadAddress = λc:Constants, k:int32, pc:int32, trace:ItemTrace, r:Recording.
   let offset := wordKey pc "offset",
       rounded := wordKey pc "offset+half",
@@ -323,10 +324,12 @@ term encodeLoadAddress = λc:Constants, k:int32, pc:int32, trace:ItemTrace, r:Re
       (inject(hydraos.riscv.derivation.Formula){sum = [atomId offset, atomId "encode/pageHalf"]}) (ruleOf "encodeLoadAddress" "offset + pageHalf"),
     r3 := addDerived r2 upper (intermediate "la: the upper part, in pages")
       (inject(hydraos.riscv.derivation.Formula){quotient = Operands{x = atomId rounded, y = atomId "encode/pageSize"}}) (ruleOf "encodeLoadAddress" "(offset + pageHalf) div pageSize"),
+    upperChecked := checkedNumber r3 upper "la" "upper part" -524288:bigint 524287:bigint,
     r4 := addDerived r3 scaled (intermediate "la: the upper part, in bytes")
       (inject(hydraos.riscv.derivation.Formula){product = Operands{x = atomId upper, y = atomId "encode/pageSize"}}) (ruleOf "encodeLoadAddress" "upper * pageSize"),
     r5 := addDerived r4 lower (intermediate "la: the lower part")
       (inject(hydraos.riscv.derivation.Formula){difference = Operands{x = atomId offset, y = atomId scaled}}) (ruleOf "encodeLoadAddress" "offset - upper * pageSize"),
+    lowerChecked := checkedNumber r5 lower "la" "lower part" -2048:bigint 2047:bigint,
     r6 := addSlots r5 pc "uSlots" (uSlots upper (copyOf rd) (copyOf (opcodeKey "la.auipc"))),
     addSlots r6 (math.add pc (Constants[instructionSize] c)) "iSlots"
       (iSlots (bitsOf lower 0:int32 12:int32) (copyOf rd) (copyOf (fixedKey "la.addi" "funct3")) (copyOf rd) (copyOf (opcodeKey "la.addi")))}
@@ -336,7 +339,9 @@ term encodeWait = λpc:int32, r:Recording.
   addSlots r pc "iSlots" (iSlots (copyOf (fixedKey "wfi" "funct12")) (copyOf (fixedKey "wfi" "rs1")) (copyOf (fixedKey "wfi" "funct3"))
     (copyOf (fixedKey "wfi" "rd")) (copyOf (opcodeKey "wfi")))
 
-## Encode one instruction placed at pc; also the number of bytes it takes.
+## Encode one instruction placed at pc; also the number of bytes it takes. That number is counted here, from
+## the words each instruction encodes to, not taken from the size constants, so that encodeItem compares
+## two independent facts: what was encoded, and the size pass 1 laid out.
 term encodeInstruction = λc:Constants, k:int32, pc:int32, trace:ItemTrace, r:Recording, instruction:Instruction.
   cases(hydraos.riscv.model.Instruction){
     addi = λi:IType. eithers.map (λr1:Recording. (r1, 4:int32)) (encodeI "addi" k pc trace r),
@@ -431,7 +436,8 @@ term encodeWith = λc:Constants, tp:TracedProgram.
     r1 := eithers.foldList layoutItem r0 steps,
     r2 := eithers.foldList (encodeItem c) r1 steps,
     image := assemble (recorded r2),
-    eithers.right (Traced{image = image, derivation = wrap(hydraos.riscv.derivation.Derivation){recorded r2}, coverage = coverage (wrap(hydraos.riscv.derivation.Derivation){recorded r2})})}
+    eithers.right (Traced{image = image, derivation = wrap(hydraos.riscv.derivation.Derivation){recorded r2},
+      coverage = coverage (wrap(hydraos.riscv.derivation.Derivation){recorded r2}), items = traces})}
 
 ## Encode a traced program with this module's constants.
 term encodeTraced = λtp:TracedProgram. encodeWith constants tp

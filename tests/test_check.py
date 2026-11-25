@@ -8,7 +8,7 @@ import pytest
 from hydra.core.overlay.python.dsl.python import Right
 
 from helpers import run_launcher
-from launcher.check import Result, apply, compare, plan, report
+from launcher.check import Edit, Mutation, Result, apply, compare, is_rejection, plan, rebuild, report
 from launcher.pipeline import REPO_ROOT, SOURCE_ROOT
 from launcher.record import record_json
 
@@ -115,11 +115,13 @@ def test_a_mutation_is_written_into_a_copy_of_the_sources(mutations, tmp_path):
     assert (SOURCE_ROOT / "hydraos/riscv/runtime.hydra").read_text(encoding="utf-8").count("lui t0 256:int32") == 1
 
 
-def test_a_rebuild_is_matched_rejected_or_mismatched_against_its_prediction(mutations):
+def test_a_rebuild_is_matched_rejected_failed_or_mismatched_against_its_prediction(mutations):
     m = mutations[0]
     assert compare(m, (b"\x00\x01", ""), b"\x00\x01", "") == Result(m, "matched", "")
     assert compare(m, (b"\x00\x01", ""), None, "addi: immediate 3413 out of range [-2048, 2047]") == Result(
         m, "rejected", "addi: immediate 3413 out of range [-2048, 2047]")
+    assert compare(m, (b"\x00\x01", ""), None, "hydraos.riscv.coder: item 1 (lui at x#y) traces to rd 6, but Hydra evaluated rd 5") == Result(
+        m, "failed", "hydraos.riscv.coder: item 1 (lui at x#y) traces to rd 6, but Hydra evaluated rd 5")
     assert compare(m, (b"\x00\x01", ""), b"\x00\x03", "") == Result(m, "mismatched", "bits (byte.bit) that differ from the prediction: 1.1")
     assert compare(m, (None, "derivation: division by zero in encode/pageSize"), b"\x00", "") == Result(
         m, "mismatched", "the build succeeded, but the record predicts no image: derivation: division by zero in encode/pageSize")
@@ -127,14 +129,56 @@ def test_a_rebuild_is_matched_rejected_or_mismatched_against_its_prediction(muta
 
 def test_the_report_counts_each_kind_and_lists_what_did_not_match(mutations):
     chars = [m for m in mutations if m.kind == "character"]
-    text = report([Result(chars[0], "matched", ""), Result(chars[1], "mismatched", "bits (byte.bit) that differ from the prediction: 88.0")], ["header"])
+    text = report([
+        Result(chars[0], "matched", ""),
+        Result(chars[1], "mismatched", "bits (byte.bit) that differ from the prediction: 88.0"),
+        Result(chars[2], "failed", "the rebuild did not finish: boom"),
+    ], ["header"])
     assert text.startswith("header\n")
-    assert "character          2        1         0           1" in text
-    assert "total              2        1         0           1" in text
+    assert "kind       mutations  matched  rejected  failed  mismatched" in text
+    assert "character          3        1         0       1           1" in text
+    assert "total              3        1         0       1           1" in text
     assert f"Mismatched: 1\n  {chars[1]}\n    bits (byte.bit) that differ from the prediction: 88.0" in text
+    assert f"Failed: 1\n  {chars[2]}\n    the rebuild did not finish: boom" in text
+
+
+def test_only_the_encoders_own_checks_count_as_rejections():
+    rejections = [
+        "addi: immediate 3413 out of range [-2048, 2047]",
+        "lui: opcode 183 out of range [0, 127]",
+        "la: lower part -4036 out of range [-2048, 2047]",
+        "register 37 out of range [0, 31]",
+        "instruction at offset 5 is not 4-byte aligned",
+        "duplicate label halt",
+        "jal: undefined label stop",
+        "beq: target main.message at offset 90 is not 4-byte aligned",
+        "item 0: encoded 4 bytes, recorded size 5",
+        "derivation: division by zero in encode/pageSize",
+    ]
+    failures = [
+        "hydraos.riscv.coder: item 1 (lui at x#y) traces to rd 6, but Hydra evaluated rd 5",
+        "hydraos.riscv.sources: no definition x4 among the sources",
+        "src/main/hydra/hydraos/riscv/runtime.hydra: 16:7: unexpected input",
+        "item 3 has no operand rd",
+        "derivation: no atom label/stop",
+        "image: byte 4 is not explained by any atom",
+        "the rebuild did not finish: TimeoutExpired",
+        "exit status -9: []",
+    ]
+    assert [e for e in rejections if not is_rejection(e)] == []
+    assert [e for e in failures if is_rejection(e)] == []
+
+
+def test_a_rebuild_that_cannot_finish_is_reported_not_raised(tmp_path):
+    broken = Mutation("number", "x", {"number": 1}, (Edit("src/main/hydra/hydraos/hello.hydra", 0, 3, "no such text", "1"),), "here")
+    image, error = rebuild(broken, tmp_path / "work")
+    assert image is None
+    assert error.startswith("the rebuild did not finish: ValueError: src/main/hydra/hydraos/hello.hydra: expected 'no such text'")
+    assert not (tmp_path / "work").exists()
 
 
 def test_the_command_is_available():
     r = run_launcher("check-derivation", "--help")
     assert r.returncode == 0, r.stderr.decode()
     assert "--jobs" in r.stdout.decode() and "--report" in r.stdout.decode()
+    assert "--source-root" not in r.stdout.decode()  # the check always checks src/main/hydra

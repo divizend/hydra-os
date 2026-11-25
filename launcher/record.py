@@ -1,13 +1,15 @@
 """The derivation record as JSON: a plain rendering of the Hydra values the coder and the encoder produce
-(hydraos.riscv.derivation), with every source place resolved to the text it names.
+(hydraos.riscv.derivation): the image's digest, its coverage, where each item of the program was written,
+and every atom, with every source place resolved to the text it names.
 
 A source place is a definition, a hydra.core.paths.SubtermPath inside its body and, inside a string
-literal, a character. It is resolved with Hydra's own parser: the definition's body is parsed with spans
-(hydra.core.parse.core.term), the path is followed step by step (hydra.core.positions.subtermAtStep), and
-a character is found by Hydra's string escape grammar (hydra.core.parse.core.escapedChar). Lines and
-columns count from 1, columns in UTF-16 code units (hydra.core.positions.offsetToPosition); an end is
-exclusive. A span links to its lines on GitHub at the commit that last changed its file, when the file is
-committed as it is.
+literal, a character. It is resolved with Hydra's own parser: the definition is found by its header
+(`term <name>` at the start of a line), its optional signature, `=` and body are read with Hydra's parsers,
+the body with spans (hydra.core.parse.core.term), the path is followed step by step
+(hydra.core.positions.subtermAtStep), and a character is found by Hydra's string escape grammar
+(hydra.core.parse.core.escapedChar). Lines and columns count from 1, columns in UTF-16 code units
+(hydra.core.positions.offsetToPosition); an end is exclusive. A span links to its lines on GitHub at the
+commit that last changed its file, when the file is committed as it is.
 
 This module computes no provenance: it only renders what the Hydra code recorded.
 """
@@ -26,7 +28,8 @@ from pathlib import Path
 
 from hydra.core import parsers
 from hydra.core.overlay.python.dsl.python import Given, Node, None_
-from hydra.core.parse.core import escaped_char, term, whitespace
+from hydra.core.parse.core import escaped_char, term, term_signature, whitespace
+from hydra.core.parse.packaging import keyword
 from hydra.core.parsing import ParseResultSuccess
 from hydra.core.paths import SubtermPath
 from hydra.core.positions import offset_to_position, peel_spans, subterm_at_step, term_span
@@ -40,13 +43,30 @@ Texts = Mapping[str, tuple[str, str]]  # module name -> (file, text)
 # any character but a quote or a backslash.
 STRING_CHARACTER = parsers.alt(parsers.try_(escaped_char()), parsers.satisfy(lambda c: c != 34 and c != 92))
 
+# What follows a term definition's name, read as Hydra's termDefinitionParser reads it: an optional
+# signature, `=`, then the body, here with its spans.
+DEFINITION_BODY = parsers.bind(
+    whitespace(),
+    lambda _: parsers.bind(
+        parsers.optional(parsers.bind(keyword(":"), lambda _: term_signature())),
+        lambda _: parsers.bind(keyword("="), lambda _: term()),
+    ),
+)
+
 
 def record_json(traced, texts: Texts, link: Callable[[str], str | None] | None = None) -> dict:
     """The record of a traced build (a hydraos.riscv.derivation.Traced): the image's size and digest, its
-    coverage, and every atom, each source place with the span of text it names."""
+    coverage, where each item of the program was written, and every atom, each source place with the span
+    of text it names."""
     derivation = sys.modules[type(traced).__module__]
-    resolve = _Resolver(texts, link or github_link(REPO_ROOT))
+    resolve = Resolver(texts, link or github_link(REPO_ROOT))
     image = bytes(traced.image)
+
+    def item(i) -> dict:
+        out = plain(derivation, i)
+        if isinstance(i.place, Given):
+            out["place"]["span"] = resolve(i.place.value)
+        return out
 
     def atom(a) -> dict:
         out = plain(derivation, a)
@@ -57,16 +77,21 @@ def record_json(traced, texts: Texts, link: Callable[[str], str | None] | None =
     return {
         "image": {"bytes": len(image), "sha256": hashlib.sha256(image).hexdigest()},
         "coverage": plain(derivation, traced.coverage),
+        "items": [item(i) for i in traced.items],
         "atoms": [atom(a) for a in traced.derivation.value],
     }
 
 
 def dumps(record: dict) -> str:
-    """The record as JSON text, one atom per line."""
-    head = [f"  {json.dumps(k)}: {json.dumps(v)}," for k, v in record.items() if k != "atoms"]
-    atoms = [json.dumps(a, ensure_ascii=False) for a in record["atoms"]]
-    body = ",\n".join(f"    {a}" for a in atoms)
-    return "{\n" + "\n".join(head) + '\n  "atoms": [\n' + body + "\n  ]\n}\n"
+    """The record as JSON text, one item or atom per line."""
+    lines = []
+    for k, v in record.items():
+        if isinstance(v, list):
+            entries = ",\n".join(f"    {json.dumps(e, ensure_ascii=False)}" for e in v)
+            lines.append(f"  {json.dumps(k)}: [\n{entries}\n  ]")
+        else:
+            lines.append(f"  {json.dumps(k)}: {json.dumps(v, ensure_ascii=False)}")
+    return "{\n" + ",\n".join(lines) + "\n}\n"
 
 
 def plain(derivation, x):
@@ -95,7 +120,7 @@ def plain(derivation, x):
     raise TypeError(f"no JSON rendering for {type(x).__name__}")
 
 
-class _Resolver:
+class Resolver:
     """Resolves source places to spans, parsing each definition's body once."""
 
     def __init__(self, texts: Texts, link: Callable[[str], str | None]):
@@ -129,12 +154,12 @@ class _Resolver:
             if module not in self.texts:
                 raise HydraError(f"record: no source text for module {module}")
             file, text = self.texts[module]
-            found = re.search(rf"^term\s+{re.escape(local)}\s*=", text, re.MULTILINE)
+            found = re.search(rf"^term\s+{re.escape(local)}(?![\w'])", text, re.MULTILINE)
             if found is None:
                 raise HydraError(f"record: {file} has no term definition {local}")
-            parsed = parsers.run_parser(parsers.bind(whitespace(), lambda _: term()), text[found.end():])
+            parsed = parsers.run_parser(DEFINITION_BODY, text[found.end():])
             if not isinstance(parsed, ParseResultSuccess):
-                raise HydraError(f"record: the body of {definition} does not parse: {parsed.value.message}")
+                raise HydraError(f"record: the definition of {definition} does not parse: {parsed.value.message}")
             self.bodies[definition] = (file, text, found.end(), parsed.value.value)
         return self.bodies[definition]
 
