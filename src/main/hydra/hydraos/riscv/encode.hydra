@@ -7,6 +7,7 @@
 ## in int32. Hydra has no primitive from bytes to binary, so the image goes through base64.
 module hydraos.riscv.encode
 
+import hydraos.riscv.derive
 import hydraos.riscv.model
 import hydra.core.lib.eithers as eithers
 import hydra.core.lib.equality as equality
@@ -19,33 +20,6 @@ import hydra.core.lib.optionals as optionals
 import hydra.core.lib.ordering as ordering
 import hydra.core.lib.pairs as pairs
 import hydra.core.lib.strings as strings
-
-## Floor division by a non-zero divisor (every divisor in this module is a positive constant).
-term quotient = λa:bigint, b:bigint. optionals.withDefault 0:bigint (math.div a b)
-
-## Floor-based remainder by a non-zero divisor; the result has the divisor's sign.
-term modulo = λa:bigint, b:bigint. optionals.withDefault 0:bigint (math.mod a b)
-
-## Floor division of int32 values by a non-zero divisor.
-term quotient32 = λa:int32, b:int32. optionals.withDefault 0:int32 (math.div a b)
-
-## Floor-based remainder of int32 values by a non-zero divisor.
-term modulo32 = λa:int32, b:int32. optionals.withDefault 0:int32 (math.mod a b)
-
-## 2 to the power n.
-term power2 = λn:int32. lists.foldl (λacc:bigint, u:unit. math.mul acc 2:bigint) 1:bigint (lists.replicate n unit)
-
-## v shifted left by n bits.
-term shifted = λv:bigint, n:int32. math.mul v (power2 n)
-
-## The width bits of a non-negative v starting at bit lo.
-term bitField = λv:bigint, lo:int32, width:int32. modulo (quotient v (power2 lo)) (power2 width)
-
-## The sum of a list of bigints.
-term sumOf = λxs:list<bigint>. lists.foldl (λa:bigint, b:bigint. math.add a b) 0:bigint xs
-
-## The 4 bytes of a 32-bit word, least significant first.
-term wordBytes = λw:bigint. lists.map (λshift:int32. literals.bigintToInt32 (bitField w shift 8:int32)) [0:int32, 8:int32, 16:int32, 24:int32]
 
 ## v as a bigint if it lies in [lo, hi]; otherwise "<mnemonic>: <what> <v> out of range [<lo>, <hi>]".
 term checkRange = λmnemonic:string, what:string, v:int32, lo:int32, hi:int32.
@@ -210,33 +184,6 @@ term encodeStep = λlabels:map<string, int32>, state:(int32, list<list<int32>>),
       instruction = λi:Instruction. encodeInstruction labels offset i,
       data = λb:binary. eithers.right (literals.binaryToBytes b)}
     item)
-
-## The base64 character code (standard alphabet) of a 6-bit value.
-term base64Char = λv:int32.
-  logic.ifElse (ordering.lt v 26:int32) (math.add 65:int32 v)
-    (logic.ifElse (ordering.lt v 52:int32) (math.add 71:int32 v)
-      (logic.ifElse (ordering.lt v 62:int32) (math.sub v 4:int32)
-        (logic.ifElse (equality.equal v 62:int32) 43:int32 47:int32)))
-
-## The 4 base64 characters of a group of 1 to 3 bytes; a short group is padded with "=".
-term base64Group = λgroup:list<int32>.
-  let count := lists.length group,
-      n := lists.foldl (λacc:int32, b:int32. math.add (math.mul acc 256:int32) b) 0:int32 (lists.take 3:int32 (lists.concat2 group [0:int32, 0:int32])),
-      chars := lists.map (λd:int32. base64Char (modulo32 (quotient32 n d) 64:int32)) [262144:int32, 4096:int32, 64:int32, 1:int32]
-  in strings.concat2 (strings.fromList (lists.take (math.add count 1:int32) chars)) (strings.fromList (lists.replicate (math.sub 3:int32 count) 61:int32))
-
-## One base64 step: (pending bytes, finished groups newest first) and a byte give the next state.
-term base64Step = λstate:(list<int32>, list<string>), b:int32.
-  let group := lists.concat2 (pairs.first state) [b]
-  in logic.ifElse (equality.equal (lists.length group) 3:int32)
-    ([], lists.cons (base64Group group) (pairs.second state))
-    (group, pairs.second state)
-
-## Standard, padded base64 of a list of bytes.
-term base64 = λbytes:list<int32>.
-  let final := lists.foldl base64Step ([], []) bytes,
-      rest := pairs.first final
-  in strings.concat (lists.concat2 (lists.reverse (pairs.second final)) (logic.ifElse (lists.isEmpty rest) [] [base64Group rest]))
 
 ## Encode a program as a flat little-endian image, or report the first problem found.
 term encodeProgram = λp:Program.

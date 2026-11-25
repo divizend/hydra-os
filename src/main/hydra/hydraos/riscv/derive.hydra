@@ -1,0 +1,281 @@
+## The derivation record's evaluator: the value a formula gives, a derivation evaluated again with one
+## atom's value changed, the image assembled from a derivation's image atoms, and how much of the image
+## a derivation explains. The encoder computes every field of the image through evaluate and assembles
+## the image here, so the image and its record are one computation.
+##
+## Also the arithmetic the encoder shares: Hydra has no bitwise primitives, so bits are taken with
+## floor division and remainder by powers of two, and bytes become a binary through base64.
+module hydraos.riscv.derive
+
+import hydraos.riscv.derivation
+import hydra.core.lib.eithers as eithers
+import hydra.core.lib.equality as equality
+import hydra.core.lib.lists as lists
+import hydra.core.lib.literals as literals
+import hydra.core.lib.logic as logic
+import hydra.core.lib.maps as maps
+import hydra.core.lib.math as math
+import hydra.core.lib.optionals as optionals
+import hydra.core.lib.ordering as ordering
+import hydra.core.lib.pairs as pairs
+import hydra.core.lib.strings as strings
+import hydra.core.lib.text as text
+
+## Floor division by a non-zero divisor.
+term quotient = λa:bigint, b:bigint. optionals.withDefault 0:bigint (math.div a b)
+
+## Floor-based remainder by a non-zero divisor; the result has the divisor's sign.
+term modulo = λa:bigint, b:bigint. optionals.withDefault 0:bigint (math.mod a b)
+
+## Floor division of int32 values by a non-zero divisor.
+term quotient32 = λa:int32, b:int32. optionals.withDefault 0:int32 (math.div a b)
+
+## Floor-based remainder of int32 values by a non-zero divisor.
+term modulo32 = λa:int32, b:int32. optionals.withDefault 0:int32 (math.mod a b)
+
+## 2 to the power n.
+term power2 = λn:int32. lists.foldl (λacc:bigint, u:unit. math.mul acc 2:bigint) 1:bigint (lists.replicate n unit)
+
+## v shifted left by n bits.
+term shifted = λv:bigint, n:int32. math.mul v (power2 n)
+
+## The width bits of v starting at bit lo, in two's complement.
+term bitField = λv:bigint, lo:int32, width:int32. modulo (quotient v (power2 lo)) (power2 width)
+
+## The sum of a list of bigints.
+term sumOf = λxs:list<bigint>. lists.foldl (λa:bigint, b:bigint. math.add a b) 0:bigint xs
+
+## The 4 bytes of a 32-bit word, least significant first.
+term wordBytes = λw:bigint. lists.map (λshift:int32. literals.bigintToInt32 (bitField w shift 8:int32)) [0:int32, 8:int32, 16:int32, 24:int32]
+
+## The base64 character code (standard alphabet) of a 6-bit value.
+term base64Char = λv:int32.
+  logic.ifElse (ordering.lt v 26:int32) (math.add 65:int32 v)
+    (logic.ifElse (ordering.lt v 52:int32) (math.add 71:int32 v)
+      (logic.ifElse (ordering.lt v 62:int32) (math.sub v 4:int32)
+        (logic.ifElse (equality.equal v 62:int32) 43:int32 47:int32)))
+
+## The 4 base64 characters of a group of 1 to 3 bytes; a short group is padded with "=".
+term base64Group = λgroup:list<int32>.
+  let count := lists.length group,
+      n := lists.foldl (λacc:int32, b:int32. math.add (math.mul acc 256:int32) b) 0:int32 (lists.take 3:int32 (lists.concat2 group [0:int32, 0:int32])),
+      chars := lists.map (λd:int32. base64Char (modulo32 (quotient32 n d) 64:int32)) [262144:int32, 4096:int32, 64:int32, 1:int32]
+  in strings.concat2 (strings.fromList (lists.take (math.add count 1:int32) chars)) (strings.fromList (lists.replicate (math.sub 3:int32 count) 61:int32))
+
+## One base64 step: (pending bytes, finished groups newest first) and a byte give the next state.
+term base64Step = λstate:(list<int32>, list<string>), b:int32.
+  let group := lists.concat2 (pairs.first state) [b]
+  in logic.ifElse (equality.equal (lists.length group) 3:int32)
+    ([], lists.cons (base64Group group) (pairs.second state))
+    (group, pairs.second state)
+
+## Standard, padded base64 of a list of bytes.
+term base64 = λbytes:list<int32>.
+  let final := lists.foldl base64Step ([], []) bytes,
+      rest := pairs.first final
+  in strings.concat (lists.concat2 (lists.reverse (pairs.second final)) (logic.ifElse (lists.isEmpty rest) [] [base64Group rest]))
+
+## A list of bytes as a binary. Hydra has no primitive from bytes to binary, so they go through base64.
+term bytesToBinary = λbytes:list<int32>. literals.base64ToBinary (base64 bytes)
+
+## A number as a value.
+term number = λn:bigint. Value{number = n}
+
+## The number a value holds; what names its atom, for the error.
+term numberOf = λwhat:string, v:Value.
+  cases(hydraos.riscv.derivation.Value){
+    number = λn:bigint. eithers.right n,
+    name = λs:string. eithers.left (strings.concat ["derivation: ", what, " holds the name ", s, ", not a number"])}
+  v
+
+## The value of every atom, by id.
+term atomValues = λatoms:list<Atom>. maps.fromList (lists.map (λa:Atom. (AtomId[] (Atom[id] a), Atom[value] a)) atoms)
+
+## The value of an atom, from the values known so far.
+term valueAt = λvalues:map<string, Value>, a:AtomId.
+  optionals.match (maps.lookup (AtomId[] a) values)
+    (eithers.left (strings.concat2 "derivation: no atom " (AtomId[] a)))
+    (λv:Value. eithers.right v)
+
+## The number an atom holds, from the values known so far.
+term numberAt = λvalues:map<string, Value>, a:AtomId. eithers.bind (valueAt values a) (λv:Value. numberOf (AtomId[] a) v)
+
+## The id of the atom holding the offset of the label named s.
+term labelAtom = λs:string. wrap(hydraos.riscv.derivation.AtomId){strings.concat2 "label/" s}
+
+## Byte k of the UTF-8 encoding of code point c.
+term utf8Byte = λc:bigint, k:int32.
+  optionals.match (lists.at k (literals.binaryToBytes (text.encodeUtf8 (strings.fromList [literals.bigintToInt32 c]))))
+    (eithers.left (strings.concat ["derivation: the UTF-8 encoding of ", literals.printBigint c, " has no byte ", literals.printInt32 k]))
+    (λbyte:int32. eithers.right (number (literals.int32ToBigint byte)))
+
+## The value a formula gives, from the values of the atoms it refers to.
+term evaluate = λvalues:map<string, Value>, f:Formula.
+  cases(hydraos.riscv.derivation.Formula){
+    stated = λu:unit. eithers.left "derivation: a stated atom has no formula to evaluate",
+    copy = λa:AtomId. valueAt values a,
+    sum = λids:list<AtomId>. eithers.map (λns:list<bigint>. number (sumOf ns)) (eithers.mapList (λa:AtomId. numberAt values a) ids),
+    difference = λo:Operands. do either {
+      x := numberAt values (Operands[x] o),
+      y := numberAt values (Operands[y] o),
+      eithers.right (number (math.sub x y))},
+    product = λo:Operands. do either {
+      x := numberAt values (Operands[x] o),
+      y := numberAt values (Operands[y] o),
+      eithers.right (number (math.mul x y))},
+    quotient = λo:Operands. do either {
+      x := numberAt values (Operands[x] o),
+      y := numberAt values (Operands[y] o),
+      logic.ifElse (equality.equal y 0:bigint)
+        (eithers.left (strings.concat2 "derivation: division by zero in " (AtomId[] (Operands[y] o))))
+        (eithers.right (number (quotient x y)))},
+    bits = λb:BitsOf. eithers.map (λn:bigint. number (bitField n (BitsOf[lo] b) (BitsOf[width] b))) (numberAt values (BitsOf[atom] b)),
+    count = λids:list<AtomId>. eithers.right (number (literals.int32ToBigint (lists.length ids))),
+    utf8 = λu:Utf8Byte. eithers.bind (numberAt values (Utf8Byte[atom] u)) (λc:bigint. utf8Byte c (Utf8Byte[index] u)),
+    labelOffset = λa:AtomId. eithers.bind (valueAt values a) (λv:Value.
+      cases(hydraos.riscv.derivation.Value){
+        name = λs:string. valueAt values (labelAtom s),
+        number = λn:bigint. eithers.left (strings.concat2 "derivation: a label reference holds a number, not a name: " (AtomId[] a))}
+      v)}
+  f
+
+## A new atom, whose value its formula gives from the values known so far.
+term derived = λvalues:map<string, Value>, key:string, place:Place, f:Formula, r:Rule.
+  eithers.map (λv:Value. Atom{id = wrap(hydraos.riscv.derivation.AtomId){key}, place = place, value = v, formula = f, rule = r})
+    (evaluate values f)
+
+## A stated atom: its value is written in a source or handed to the step that records it.
+term stated = λkey:string, place:Place, v:Value, r:Rule.
+  Atom{id = wrap(hydraos.riscv.derivation.AtomId){key}, place = place, value = v, formula = inject(hydraos.riscv.derivation.Formula){stated = unit}, rule = r}
+
+## An atom with another value.
+term withValue = λa:Atom, v:Value. Atom{id = Atom[id] a, place = Atom[place] a, value = v, formula = Atom[formula] a, rule = Atom[rule] a}
+
+## The value an atom gets when its derivation is evaluated again with target holding v: a stated atom keeps
+## its value, any other is evaluated.
+term reevaluate = λvalues:map<string, Value>, target:AtomId, v:Value, a:Atom.
+  logic.ifElse (equality.equal (AtomId[] (Atom[id] a)) (AtomId[] target))
+    (eithers.right v)
+    (cases(hydraos.riscv.derivation.Formula){
+       stated = λu:unit. eithers.right (Atom[value] a),
+       `_` = evaluate values (Atom[formula] a)}
+     (Atom[formula] a))
+
+## The image a derivation gives when the atom target holds v instead: every formula is evaluated again.
+term predict = λd:Derivation, target:AtomId, v:Value.
+  eithers.bind
+    (eithers.foldList
+      (λacc:(map<string, Value>, list<Atom>), a:Atom.
+        eithers.map (λnv:Value. (maps.insert (AtomId[] (Atom[id] a)) nv (pairs.first acc), lists.cons (withValue a nv) (pairs.second acc)))
+          (reevaluate (pairs.first acc) target v a))
+      (maps.empty, [])
+      (Derivation[] d))
+    (λacc:(map<string, Value>, list<Atom>). assemble (lists.reverse (pairs.second acc)))
+
+## The image field each atom that lives in the image contributes.
+term imageFields = λatoms:list<Atom>.
+  eithers.map (λfs:list<list<ImageField>>. lists.concat fs)
+    (eithers.mapList
+      (λa:Atom.
+        cases(hydraos.riscv.derivation.Place){
+          image = λp:ImagePlace. eithers.map
+            (λn:bigint. [ImageField{offset = ImagePlace[offset] p, lo = ImagePlace[lo] p, width = ImagePlace[width] p, value = n, atom = AtomId[] (Atom[id] a)}])
+            (numberOf (AtomId[] (Atom[id] a)) (Atom[value] a)),
+          `_` = eithers.right []}
+        (Atom[place] a))
+      atoms)
+
+## The fields of each unit, by the unit's offset.
+term units = λfs:list<ImageField>.
+  lists.foldl
+    (λm:map<int32, list<ImageField>>, f:ImageField.
+      maps.insert (ImageField[offset] f) (lists.cons f (maps.findWithDefault [] (ImageField[offset] f) m)) m)
+    maps.empty fs
+
+## The bytes of one unit. Its fields must tile it exactly from bit 0, as a byte or as a 32-bit
+## little-endian word, and each field's value must fit its width.
+term unitBytes = λoffset:int32, fields:list<ImageField>.
+  let where := strings.concat2 " of the unit at offset " (literals.printInt32 offset)
+  in do either {
+    tiled := eithers.foldList
+      (λacc:(int32, bigint), f:ImageField.
+        let next := pairs.first acc,
+            lo := ImageField[lo] f,
+            v := ImageField[value] f
+        in logic.ifElse (ordering.gt lo next)
+          (eithers.left (strings.concat ["image: bit ", literals.printInt32 next, where, " is not explained by any atom"]))
+          (logic.ifElse (ordering.lt lo next)
+            (eithers.left (strings.concat ["image: bit ", literals.printInt32 lo, where, " is explained by two atoms"]))
+            (logic.ifElse (logic.or (ordering.lt v 0:bigint) (ordering.gte v (power2 (ImageField[width] f))))
+              (eithers.left (strings.concat ["image: atom ", ImageField[atom] f, " holds ", literals.printBigint v, ", which does not fit in ", literals.printInt32 (ImageField[width] f), " bits"]))
+              (eithers.right (math.add lo (ImageField[width] f), math.add (pairs.second acc) (shifted v lo))))))
+      (0:int32, 0:bigint)
+      (lists.sortBy (λf:ImageField. ImageField[lo] f) fields),
+    logic.ifElse (equality.equal (pairs.first tiled) 32:int32)
+      (eithers.right (wordBytes (pairs.second tiled)))
+      (logic.ifElse (equality.equal (pairs.first tiled) 8:int32)
+        (eithers.right [literals.bigintToInt32 (pairs.second tiled)])
+        (eithers.left (strings.concat ["image: the unit at offset ", literals.printInt32 offset, " ends at bit ", literals.printInt32 (pairs.first tiled), "; a unit is a byte or a 32-bit word"])))}
+
+## The image a derivation's image atoms give. The units must tile the image from byte 0.
+term assemble = λatoms:list<Atom>.
+  do either {
+    fields := imageFields atoms,
+    bytes := eithers.foldList
+      (λacc:(int32, list<list<int32>>), u:(int32, list<ImageField>).
+        let offset := pairs.first u,
+            expected := pairs.first acc
+        in logic.ifElse (ordering.gt offset expected)
+          (eithers.left (strings.concat ["image: byte ", literals.printInt32 expected, " is not explained by any atom"]))
+          (logic.ifElse (ordering.lt offset expected)
+            (eithers.left (strings.concat ["image: byte ", literals.printInt32 offset, " is explained by two atoms"]))
+            (eithers.map (λbs:list<int32>. (math.add offset (lists.length bs), lists.cons bs (pairs.second acc)))
+              (unitBytes offset (pairs.second u)))))
+      (0:int32, [])
+      (maps.toList (units fields)),
+    eithers.right (bytesToBinary (lists.concat (lists.reverse (pairs.second bytes))))}
+
+## The atoms a formula refers to; a label reference also refers to the label it names.
+term references = λvalues:map<string, Value>, f:Formula.
+  cases(hydraos.riscv.derivation.Formula){
+    stated = λu:unit. [],
+    copy = λa:AtomId. [a],
+    sum = λids:list<AtomId>. ids,
+    difference = λo:Operands. [Operands[x] o, Operands[y] o],
+    product = λo:Operands. [Operands[x] o, Operands[y] o],
+    quotient = λo:Operands. [Operands[x] o, Operands[y] o],
+    bits = λb:BitsOf. [BitsOf[atom] b],
+    count = λids:list<AtomId>. ids,
+    utf8 = λu:Utf8Byte. [Utf8Byte[atom] u],
+    labelOffset = λa:AtomId. lists.cons a (optionals.match (maps.lookup (AtomId[] a) values) []
+      (λv:Value. cases(hydraos.riscv.derivation.Value){
+        name = λs:string. [labelAtom s],
+        number = λn:bigint. []}
+        v))}
+  f
+
+## Whether every stated atom that an atom depends on lies in source text.
+term rootedInSource = λbyId:map<string, Atom>, values:map<string, Value>, a:Atom.
+  cases(hydraos.riscv.derivation.Formula){
+    stated = λu:unit. cases(hydraos.riscv.derivation.Place){source = λs:SourcePlace. true, `_` = false} (Atom[place] a),
+    `_` = lists.foldl
+      (λok:boolean, r:AtomId. logic.and ok (optionals.match (maps.lookup (AtomId[] r) byId) false (λb:Atom. rootedInSource byId values b)))
+      true
+      (references values (Atom[formula] a))}
+  (Atom[formula] a)
+
+## How much of the image a derivation explains.
+term coverage = λd:Derivation.
+  let atoms := Derivation[] d,
+      byId := maps.fromList (lists.map (λa:Atom. (AtomId[] (Atom[id] a), a)) atoms),
+      values := atomValues atoms,
+      widths := lists.map
+        (λa:Atom. cases(hydraos.riscv.derivation.Place){
+          image = λp:ImagePlace. (ImagePlace[width] p, rootedInSource byId values a),
+          `_` = (0:int32, false)}
+          (Atom[place] a))
+        atoms
+  in Coverage{
+    bits = lists.foldl (λn:int32, w:(int32, boolean). math.add n (pairs.first w)) 0:int32 widths,
+    sourceBits = lists.foldl (λn:int32, w:(int32, boolean). logic.ifElse (pairs.second w) (math.add n (pairs.first w)) n) 0:int32 widths,
+    atoms = lists.length atoms}

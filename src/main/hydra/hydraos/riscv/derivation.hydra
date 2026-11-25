@@ -1,0 +1,81 @@
+## The derivation record of a build: every piece of data that went into the boot image (an atom), where
+## it lives, its value, how that value follows from other atoms, and which Hydra definition applied
+## that step.
+module hydraos.riscv.derivation
+
+import hydra.core.paths
+import hydraos.riscv.model
+
+## The key of an atom, unique within one derivation.
+type AtomId = wrap(string)
+
+# A value: a number, or a name (the name of a label).
+type Value = union{
+  number: bigint,
+  name: string}
+
+## A place in a .hydra source: the subterm at path in the body of a definition and, inside a string
+## literal, one character, counted from 0.
+type SourcePlace = record{definition: string, path: SubtermPath, character: optional<int32>}
+
+## Bits of the boot image: width bits from bit lo of the unit (a 32-bit little-endian word, or a byte)
+## that starts at byte offset.
+type ImagePlace = record{offset: int32, lo: int32, width: int32}
+
+# Where an atom lives: in a source file, as a named intermediate value of the build, or in the image.
+type Place = union{
+  source: SourcePlace,
+  intermediate: string,
+  image: ImagePlace}
+
+## Two atoms, for the binary formulas.
+type Operands = record{x: AtomId, y: AtomId}
+
+## Bits lo to lo + width - 1 of an atom's value, in two's complement.
+type BitsOf = record{atom: AtomId, lo: int32, width: int32}
+
+## Byte index of the UTF-8 encoding of the code point an atom holds.
+type Utf8Byte = record{atom: AtomId, index: int32}
+
+# How an atom's value follows from other atoms. A stated atom's value is written in a source, or handed
+# to the step that records it. labelOffset is the offset of the label an atom names; quotient rounds
+# toward minus infinity.
+type Formula = union{
+  stated: unit,
+  copy: AtomId,
+  sum: list<AtomId>,
+  difference: Operands,
+  product: Operands,
+  quotient: Operands,
+  bits: BitsOf,
+  count: list<AtomId>,
+  utf8: Utf8Byte,
+  labelOffset: AtomId}
+
+## The Hydra definition whose code applied a formula, and a word on what it did.
+type Rule = record{definition: string, detail: string}
+
+## One piece of data of a build.
+type Atom = record{id: AtomId, place: Place, value: Value, formula: Formula, rule: Rule}
+
+## Every atom of one build, in an order in which each formula refers only to atoms before it.
+type Derivation = wrap(list<Atom>)
+
+## One field of the image: the offset of its unit, its lowest bit, its width, its value and its atom.
+type ImageField = record{offset: int32, lo: int32, width: int32, value: bigint, atom: string}
+
+## The atom holding one operand of a program item, by the operand's role: rd, rs1, rs2, imm or target.
+type OperandAtom = record{role: string, atom: AtomId}
+
+## Where one item of a program came from: the subterm that wrote it, if known, and its operands' atoms.
+type ItemTrace = record{place: optional<SourcePlace>, operands: list<OperandAtom>}
+
+## A program, where its items came from, and the atoms recorded so far.
+type TracedProgram = record{program: Program, items: list<ItemTrace>, atoms: list<Atom>}
+
+## How much of an image a derivation explains: its bits, the bits whose stated atoms all lie in source
+## text, and the number of atoms.
+type Coverage = record{bits: int32, sourceBits: int32, atoms: int32}
+
+## A boot image with its derivation.
+type Traced = record{image: binary, derivation: Derivation, coverage: Coverage}
