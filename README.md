@@ -19,8 +19,9 @@ serializer. This repo applies that to bare metal, so the RISC-V machine becomes 
 hello.hydra            the kernel: main = writeStdout (encodeUtf8 "Hello from Hydra\n")
   → parse, infer       Hydra 0.18.1's own parser and type inference
   → riscv/coder.hydra  main becomes a RISC-V program, as Hydra data, joined with riscv/runtime.hydra
-  → riscv/encode.hydra the program becomes bytes
+  → riscv/encode.hydra the program becomes bytes, each field derived as an atom of the build's record
   → out/hello.bin      105 bytes; QEMU loads them at 0x8000_0000 and the CPU runs them
+    out/hello.derivation.json   where every bit of them came from
 ```
 
 Every byte of `out/hello.bin` is computed by Hydra code: no assembler, linker or C compiler is
@@ -66,9 +67,61 @@ python -m venv .venv
 .venv/bin/python -m launcher build
 ```
 
-This writes `out/hello.bin`. The first build decodes Hydra's kernel (about a minute) and caches it
-under `build/cache/`. Later builds take about 40 seconds, almost all of it Hydra's type inference on
-the Python host.
+This writes `out/hello.bin` and its derivation record, `out/hello.derivation.json` (see below). The
+first build decodes Hydra's kernel (about a minute) and caches it under `build/cache/`. Later builds
+take about two minutes, almost all of it Hydra's type inference and code generation on the Python
+host.
+
+## Explain it
+
+`build` also reports how much of the image its record explains:
+
+```
+derivation: 840 of 840 bits explained, 840 traced to source, 336 atoms
+```
+
+The record, [`out/hello.derivation.json`](out/hello.derivation.json), lists the *atoms* of the build:
+every piece of data that went into the image, such as a character of the message, an operand, a
+constant of the encoder, an offset or a field of an instruction. Each atom has
+
+- a place: where it is written in a `.hydra` source (a Hydra `SubtermPath` in a definition's body,
+  resolved to its file, line, column, text and a GitHub link to that line), a named intermediate
+  value of the build, or bits of the image;
+- a value: a number, or the name of a label;
+- a formula that gives its value from earlier atoms: stated (written in a source), copy, sum,
+  difference, product, quotient, bits, count, utf8 or labelOffset;
+- a rule: the Hydra definition whose code applied that formula.
+
+The encoder computes every field of the image through these formulas and assembles the image from the
+atoms that live in it, so the bytes and their explanation are one computation; the build fails if the
+atoms do not tile the image exactly. Following any field back ends in source text. Byte 0x31, for
+example, holds bits of `beq a1 zero "writeStdout.done"`: its `rs1` bits copy the 11 written in
+`dsl.hydra`'s definition of `a1`, its `funct3` bits come from `encode.hydra`'s table of encodings, and
+its offset bits are the offset of the label `writeStdout.done` minus the branch's own.
+
+The coder traces each operand by reading the sources as data, and checks every value it traces against
+the program Hydra evaluated. The design is in
+[the spec](docs/superpowers/specs/2026-11-25-derivation-record-design.md).
+
+### Check the record
+
+```
+.venv/bin/python -m launcher check-derivation --jobs 8 --report derivation-check.txt
+```
+
+This changes one source atom at a time in a copy of the sources (each character of the message, each
+operand in `runtime.hydra` and `coder.hydra`, each register number in `dsl.hydra`, each constant in
+`encode.hydra`: 694 changes), rebuilds each copy with `build` in a fresh process, and compares the
+image with what the record predicts for that change. Every build that succeeds must match its
+prediction bit for bit; builds the encoder rejects are listed with their error. The report of the last
+full run, with every change and its outcome, is in
+[docs/evidence](docs/evidence/2026-11-25-derivation-check.txt).
+
+### Keep it current
+
+Each span's link pins the commit that last changed its file. After changing a `.hydra` file, commit it
+first, then run `build` and commit the new record; `tests/test_record.py` fails while the committed
+record differs from a fresh build.
 
 ## Run it on Hydra's Python host
 
@@ -92,8 +145,11 @@ the bytes the encoder produces, to check them, and never produces any itself.
 
 ```
 src/main/hydra/hydraos/   the kernel (hello.hydra) and the RISC-V host (riscv/*.hydra)
-launcher/                 Python glue that runs Hydra's pipeline; it holds no project logic
+launcher/                 Python glue that runs Hydra's pipeline, writes the record and runs its check;
+                          it holds no project logic
 tests/                    the pytest suite, with its .hydra fixtures
 out/hello.bin             the committed boot image
-docs/superpowers/         the design and the implementation plan
+out/hello.derivation.json its committed derivation record
+docs/superpowers/         the designs and the implementation plans
+docs/evidence/            reports of runs, such as the derivation check
 ```
